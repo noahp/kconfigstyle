@@ -851,6 +851,481 @@ class TestEdgeCases:
         assert str(issue_no_col) == "Line 10: [warning] Test message"
 
 
+class TestHelpTextReflow:
+    """Test help text reflow functionality."""
+
+    def test_reflow_basic(self):
+        """Test basic help text reflow."""
+        config = LinterConfig.zephyr_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 80
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "\t  This is a very long help text that should be reflowed to fit within the maximum line length setting when the reflow option is enabled.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Check that all lines are within length limit
+            for line in formatted:
+                assert len(line.rstrip("\n")) <= 80, f"Line exceeds 80 chars: {line}"
+
+            # Check that we have multiple help text lines (index 3 onwards after help keyword)
+            help_text_lines = [
+                line
+                for line in formatted[3:]
+                if line.strip() and not line.strip().startswith("config")
+            ]
+            assert len(help_text_lines) > 1, (
+                f"Help text should be wrapped into multiple lines, got: {help_text_lines}"
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_with_paragraphs(self):
+        """Test that reflow preserves paragraph breaks."""
+        config = LinterConfig.zephyr_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 60
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "\t  First paragraph with some long text that needs wrapping.\n",
+            "\n",
+            "\t  Second paragraph also with long text.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Check that there's an empty line between paragraphs
+            assert any(line.strip() == "" for line in formatted[3:]), (
+                "Should preserve paragraph break"
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_with_spaces(self):
+        """Test reflow with space indentation (ESP-IDF style)."""
+        config = LinterConfig.espidf_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 80
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST_OPTION\n",
+            '    bool "Test option"\n',
+            "    help\n",
+            "        This is a very long help text that should be reflowed to fit within the maximum line length setting. It should use space indentation.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Find help text lines (after the help keyword)
+            help_start = next(
+                i
+                for i, line in enumerate(formatted)
+                if "help" in line.lower() and "bool" not in line.lower()
+            )
+            help_lines = [line for line in formatted[help_start + 1 :] if line.strip()]
+
+            # Check all help lines use spaces (no tabs)
+            for line in help_lines:
+                assert "\t" not in line, (
+                    f"Help text should use spaces, not tabs: {line}"
+                )
+
+            # Check lines are within limit
+            for line in help_lines:
+                assert len(line.rstrip("\n")) <= 80
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_hierarchical_indent(self):
+        """Test reflow with hierarchical indentation."""
+        config = LinterConfig.espidf_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 70
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            'menu "Test Menu"\n',
+            "    config NESTED\n",
+            '        bool "Nested"\n',
+            "        help\n",
+            "            This help text is inside a menu and should be properly indented when using hierarchical mode.\n",
+            "endmenu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Find help text lines (after help keyword)
+            help_start = next(
+                i for i, line in enumerate(formatted) if line.strip() == "help"
+            )
+            help_lines = [
+                line
+                for line in formatted[help_start + 1 :]
+                if line.strip() and "endmenu" not in line
+            ]
+
+            # Verify indentation is correct (should be more than base level)
+            for line in help_lines:
+                # Should have significant indentation due to nesting
+                assert line.startswith("        "), (
+                    f"Help text should be indented for nested item: {repr(line)}"
+                )
+
+            # Check lines are within limit
+            for line in help_lines:
+                assert len(line.rstrip("\n")) <= 70
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_short_text(self):
+        """Test that short help text is not unnecessarily modified."""
+        config = LinterConfig.zephyr_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 100
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "\t  Short help.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Find help text line
+            help_line = [line for line in formatted if "Short help" in line][0]
+
+            # Should be on a single line
+            assert "Short help." in help_line
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_disabled_by_default(self):
+        """Test that reflow is disabled by default."""
+        config = LinterConfig.zephyr_preset()
+        # reflow_help_text defaults to False
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "\t  This is a very long help text that would normally be reflowed if the option was enabled but should remain on one line.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Find help text lines
+            help_lines = [line for line in formatted if "This is a very long" in line]
+
+            # Should be on a single line (not reflowed)
+            assert len(help_lines) == 1, (
+                "Help text should not be reflowed when disabled"
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_reflow_multiple_configs(self):
+        """Test reflow with multiple config sections."""
+        config = LinterConfig.zephyr_preset()
+        config.reflow_help_text = True
+        config.max_line_length = 60
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST1\n",
+            '\tbool "Test 1"\n',
+            "\thelp\n",
+            "\t  First config with long help text that needs wrapping.\n",
+            "\n",
+            "config TEST2\n",
+            '\tbool "Test 2"\n',
+            "\thelp\n",
+            "\t  Second config also with long help text.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Check all lines are within limit
+            for line in formatted:
+                if line.strip():  # Non-empty lines
+                    assert len(line.rstrip("\n")) <= 60, f"Line too long: {line}"
+
+            # Should have both config sections
+            assert sum(1 for line in formatted if "config TEST" in line) == 2
+        finally:
+            temp_path.unlink()
+
+
+class TestContinuationLines:
+    """Test continuation line handling with backslashes."""
+
+    def test_wrap_long_depends_on(self):
+        """Test wrapping long depends on lines."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 50
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tdepends on FOO && BAR && BAZ && QUX && VERY_LONG_NAME\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Should have continuation lines
+            cont_lines = [
+                line
+                for line in formatted
+                if "\\" in line or ("&&" in line and "depends" not in line)
+            ]
+            assert len(cont_lines) > 0, (
+                f"Long depends should be split, got: {formatted}"
+            )
+
+            # First depends line should end with backslash
+            depends_line = [line for line in formatted if "depends" in line][0]
+            assert depends_line.rstrip().endswith("\\"), (
+                f"Continuation should end with backslash: {depends_line}"
+            )
+
+            # All lines should be within limit
+            for line in formatted:
+                assert len(line.rstrip("\n")) <= 50, (
+                    f"Line too long ({len(line.rstrip())}): {line}"
+                )
+        finally:
+            temp_path.unlink()
+
+    def test_join_existing_continuations(self):
+        """Test that existing continuation lines are joined and reformatted."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 100
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tselect A && \\\n",
+            "\t\tB && \\\n",
+            "\t\tC\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Should be joined into single line (since it fits in 100 chars)
+            select_lines = [line for line in formatted if "select" in line]
+            assert len(select_lines) == 1, "Short continuation should be joined"
+            assert "\\" not in select_lines[0], "No backslash needed for short line"
+        finally:
+            temp_path.unlink()
+
+    def test_wrap_if_statement(self):
+        """Test wrapping long if statements."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 40
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "if NETWORKING && WIFI_ENABLED && BLUETOOTH_SUPPORT\n",
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "endif\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Should have continuation for if
+            if_lines = [
+                line
+                for line in formatted
+                if "if" in line.lower() and "endif" not in line.lower()
+            ]
+            assert any("\\" in line for line in if_lines), (
+                f"Long if should have continuation, got: {if_lines}"
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_continuation_with_spaces(self):
+        """Test continuation with space indentation."""
+        config = LinterConfig.espidf_preset()
+        config.max_line_length = 60
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST_OPTION\n",
+            '    bool "Test"\n',
+            "    depends on A && B && C && D && E && F\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Should use spaces for continuation indent
+            cont_lines = [
+                line for line in formatted if "&&" in line and "depends" not in line
+            ]
+            for line in cont_lines:
+                assert "\t" not in line, "Continuation should use spaces"
+        finally:
+            temp_path.unlink()
+
+    def test_no_wrap_for_short_lines(self):
+        """Test that short lines are not wrapped."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 100
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tdepends on FOO && BAR\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Should not have any backslashes
+            assert not any("\\" in line for line in formatted), (
+                "Short lines should not be wrapped"
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_continuation_hierarchical_indent(self):
+        """Test continuation lines with hierarchical indentation."""
+        config = LinterConfig.espidf_preset()
+        config.max_line_length = 60
+        linter = KconfigLinter(config)
+
+        input_lines = [
+            'menu "Test"\n',
+            "    config NESTED\n",
+            '        bool "Nested"\n',
+            "        select FEAT_A && FEAT_B && FEAT_C && FEAT_D\n",
+            "endmenu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(input_lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+
+            # Find continuation lines
+            cont_lines = [
+                line for line in formatted if "&&" in line and "select" not in line
+            ]
+
+            # Should have proper hierarchical indentation
+            for line in cont_lines:
+                # Should be indented more than the base config level
+                assert line.startswith("        "), (
+                    f"Continuation should maintain hierarchy: {repr(line)}"
+                )
+        finally:
+            temp_path.unlink()
+
+
 class TestCLI:
     """Test command-line interface."""
 
@@ -1048,6 +1523,7 @@ class TestCLI:
                     "2",
                     "--indent-sub-items",
                     "--consolidate-empty-lines",
+                    "--reflow-help",
                     "--write",
                     "--verbose",
                     str(temp_path),
@@ -1057,5 +1533,44 @@ class TestCLI:
                 text=True,
             )
             assert "Formatted" in result.stdout
+        finally:
+            temp_path.unlink()
+
+    def test_cli_reflow_help(self):
+        """Test CLI with reflow help option."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.write(
+                'config TEST\n\tbool "Test"\n\thelp\n\t  This is a very long help text that should be reflowed to fit within the specified maximum line length when using the reflow option.\n'
+            )
+            temp_path = Path(f.name)
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "main.py",
+                    "--reflow-help",
+                    "--max-line-length",
+                    "60",
+                    "--write",
+                    str(temp_path),
+                ],
+                cwd=Path(__file__).parent.parent,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0
+            assert "Formatted" in result.stdout
+
+            # Verify file was reflowed
+            with open(temp_path) as f:
+                content = f.read()
+                lines = content.split("\n")
+                # All non-empty lines should be within limit
+                for line in lines:
+                    if line.strip():
+                        assert len(line) <= 60, f"Line too long: {line}"
         finally:
             temp_path.unlink()

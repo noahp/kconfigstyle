@@ -23,6 +23,7 @@ class LinterConfig:
     enforce_uppercase_configs: bool = False
     indent_sub_items: bool = False
     consolidate_empty_lines: bool = False
+    reflow_help_text: bool = False
 
     @classmethod
     def zephyr_preset(cls) -> "LinterConfig":
@@ -109,12 +110,22 @@ class KconfigLinter:
         in_help = False
         indent_level = 0
         prev_was_empty = False
+        help_lines = []  # Collect help text lines for reflow
 
-        for line in lines:
+        # First pass: join continuation lines
+        joined_lines = self._join_continuation_lines(lines)
+
+        for line in joined_lines:
             line_no_newline = line.rstrip("\n\r")
 
             # Skip if empty
             if not line.strip():
+                # If we're in help and collecting lines for reflow, add empty line as paragraph break
+                if in_help and self.config.reflow_help_text:
+                    help_lines.append("")
+                    prev_was_empty = True
+                    continue
+
                 # Consolidate empty lines if configured
                 if self.config.consolidate_empty_lines:
                     if not prev_was_empty:
@@ -142,17 +153,45 @@ class KconfigLinter:
                 "source",
                 "comment",
             ]:
+                # Flush collected help text with reflow
+                if self.config.reflow_help_text and help_lines:
+                    formatted.extend(self._reflow_help_text(help_lines, indent_level))
+                    help_lines = []
                 in_help = False
 
             # Update indent level (for end markers, do it before formatting)
             if line_type in ["endmenu", "endif", "endchoice"] and indent_level > 0:
                 indent_level -= 1
 
-            # Format the line
-            formatted_line = self._format_line(
-                stripped, line_type, indent_level, in_help
-            )
-            formatted.append(formatted_line)
+            # If we're in help and reflow is enabled, collect the text
+            if (
+                in_help
+                and self.config.reflow_help_text
+                and not stripped.startswith("help")
+            ):
+                help_lines.append(stripped)
+                # Don't format yet, we'll reflow later
+            else:
+                # Format the line normally
+                formatted_line = self._format_line(
+                    stripped, line_type, indent_level, in_help
+                )
+
+                # Check if this line should be wrapped with continuations
+                if (
+                    line_type in ["option", "if"]
+                    and len(formatted_line) > self.config.max_line_length
+                ):
+                    # Get the base indent for this line
+                    indent_str = formatted_line[
+                        : len(formatted_line) - len(formatted_line.lstrip())
+                    ]
+                    wrapped = self._wrap_continuation_line(
+                        formatted_line, indent_str, line_type
+                    )
+                    formatted.extend(wrapped)
+                else:
+                    formatted.append(formatted_line)
 
             # Update help state AFTER formatting (for help keyword)
             if line_type == "help":
@@ -162,6 +201,10 @@ class KconfigLinter:
             if line_type in ["menu", "if", "choice"]:
                 indent_level += 1
 
+        # Flush any remaining help text
+        if self.config.reflow_help_text and help_lines:
+            formatted.extend(self._reflow_help_text(help_lines, indent_level))
+
         # Ensure file ends with newline
         result = [
             line + "\n" if line or i < len(formatted) - 1 else line
@@ -169,10 +212,57 @@ class KconfigLinter:
         ]
         return result
 
+    def _join_continuation_lines(self, lines: list[str]) -> list[str]:
+        """Join lines that end with backslash continuation.
+
+        Args:
+            lines: Original lines from file
+
+        Returns:
+            List of lines with continuations joined
+        """
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].rstrip("\n\r")
+
+            # Check if this line ends with backslash
+            if line.rstrip().endswith("\\"):
+                # Collect all continuation lines
+                joined = line.rstrip()[:-1].rstrip()  # Remove \ and trailing space
+                i += 1
+
+                # Keep joining while we have continuations
+                while i < len(lines):
+                    next_line = lines[i].rstrip("\n\r")
+                    stripped = next_line.lstrip()
+
+                    if next_line.rstrip().endswith("\\"):
+                        # Another continuation
+                        joined += " " + stripped[:-1].rstrip()
+                        i += 1
+                    else:
+                        # Last line of continuation
+                        joined += " " + stripped
+                        i += 1
+                        break
+
+                result.append(joined + "\n")
+            else:
+                result.append(line + "\n")
+                i += 1
+
+        return result
+
     def _format_line(
         self, stripped: str, line_type: str, indent_level: int, in_help: bool
     ) -> str:
-        """Format a single line with proper indentation."""
+        """Format a single line with proper indentation.
+
+        Returns a single line string, which may need to be split into multiple
+        lines if it's too long and supports continuation.
+        """
         # Determine indentation
         if in_help and not stripped.startswith("help"):
             # Help text indentation
@@ -231,6 +321,171 @@ class KconfigLinter:
         # Remove trailing whitespace
         result = (indent + stripped).rstrip()
         return result
+
+    def _wrap_continuation_line(
+        self, line: str, indent: str, line_type: str
+    ) -> list[str]:
+        """Wrap a long line using backslash continuation.
+
+        Args:
+            line: The full line including indentation
+            indent: The base indentation for this line
+            line_type: Type of line (option, if, etc.)
+
+        Returns:
+            List of lines with continuation backslashes
+        """
+        # If line is short enough, return as-is
+        if len(line) <= self.config.max_line_length:
+            return [line]
+
+        # Strip the base indent to work with content
+        if not line.startswith(indent):
+            return [line]  # Can't process if indent doesn't match
+
+        content = line[len(indent) :]
+
+        # Determine what kind of wrapping we can do
+        # For "depends on", "select", "default", etc., we can break at && or ||
+        if line_type == "option":
+            # Check for logical operators
+            if " && " in content or " || " in content:
+                return self._wrap_at_logical_operators(content, indent)
+
+        # For "if" statements, similar logic
+        if line_type == "if":
+            if " && " in content or " || " in content:
+                return self._wrap_at_logical_operators(content, indent)
+
+        # If no special wrapping applies, return as-is
+        return [line]
+
+    def _wrap_at_logical_operators(self, content: str, base_indent: str) -> list[str]:
+        """Wrap a line at logical operators (&& or ||).
+
+        Args:
+            content: The line content without base indentation
+            base_indent: The indentation string to use for first line
+
+        Returns:
+            List of wrapped lines with backslash continuations
+        """
+        # Calculate continuation indent (base + one more level)
+        if self.config.use_spaces:
+            cont_indent = base_indent + " " * self.config.primary_indent_spaces
+        else:
+            cont_indent = base_indent + "\t"
+
+        # Split by logical operators while preserving them
+        import re
+
+        # Split but keep the operators
+        parts = re.split(r"(\s+(?:&&|\|\|)\s+)", content)
+
+        lines = []
+        current_line = base_indent + parts[0]
+
+        for i in range(1, len(parts), 2):
+            if i + 1 >= len(parts):
+                break
+
+            operator = parts[i].strip()
+            next_part = parts[i + 1]
+
+            # Try to add operator and next part to current line
+            test_line = f"{current_line} {operator} {next_part}"
+
+            # Check if it fits (accounting for the " \" at the end)
+            if len(test_line) + 2 <= self.config.max_line_length:
+                current_line = test_line
+            else:
+                # Flush current line with backslash
+                lines.append(current_line.rstrip() + " \\")
+                current_line = f"{cont_indent}{operator} {next_part}"
+
+        # Add the last line (no backslash)
+        lines.append(current_line.rstrip())
+
+        return lines
+
+    def _reflow_help_text(self, help_lines: list[str], indent_level: int) -> list[str]:
+        """Reflow help text to fit within max line length.
+
+        Args:
+            help_lines: List of help text lines (already stripped of indentation)
+            indent_level: Current hierarchical indent level
+
+        Returns:
+            List of formatted help text lines with proper indentation
+        """
+        # Calculate the indent for help text
+        if self.config.use_spaces:
+            base_indent = self.config.primary_indent_spaces
+            if self.config.indent_sub_items:
+                base_indent += indent_level * self.config.primary_indent_spaces
+            indent_str = " " * (base_indent + self.config.help_indent_spaces)
+        else:
+            base_tabs = 1
+            if self.config.indent_sub_items:
+                base_tabs += indent_level
+            indent_str = "\t" * base_tabs + " " * self.config.help_indent_spaces
+
+        # Calculate available width for text
+        indent_width = len(
+            indent_str.replace("\t", " " * 4)
+        )  # Assume tab = 4 spaces for width calc
+        available_width = self.config.max_line_length - indent_width
+
+        if available_width < 20:  # Sanity check
+            available_width = 40
+
+        formatted = []
+
+        # Process help text in paragraphs (separated by empty lines)
+        paragraphs = []
+        current_paragraph = []
+
+        for line in help_lines:
+            if not line:  # Empty line = paragraph break
+                if current_paragraph:
+                    paragraphs.append(current_paragraph)
+                    current_paragraph = []
+                paragraphs.append([])  # Preserve empty line
+            else:
+                current_paragraph.append(line)
+
+        if current_paragraph:
+            paragraphs.append(current_paragraph)
+
+        # Reflow each paragraph
+        for paragraph in paragraphs:
+            if not paragraph:  # Empty paragraph (was an empty line)
+                formatted.append("")
+                continue
+
+            # Join paragraph into single text
+            text = " ".join(paragraph)
+
+            # Split into words and reflow
+            words = text.split()
+            if not words:
+                continue
+
+            current_line = words[0]
+            for word in words[1:]:
+                # Check if adding this word would exceed the line length
+                if len(current_line) + 1 + len(word) <= available_width:
+                    current_line += " " + word
+                else:
+                    # Flush current line and start new one
+                    formatted.append(indent_str + current_line)
+                    current_line = word
+
+            # Add the last line
+            if current_line:
+                formatted.append(indent_str + current_line)
+
+        return formatted
 
     def _lint_lines(self, lines: list[str]):
         """Perform linting on the lines of a Kconfig file."""
@@ -579,6 +834,11 @@ Examples:
         action="store_true",
         help="Consolidate multiple consecutive empty lines into one",
     )
+    parser.add_argument(
+        "--reflow-help",
+        action="store_true",
+        help="Reflow help text to fit within max line length",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show detailed output")
 
     args = parser.parse_args()
@@ -611,6 +871,8 @@ Examples:
         config.indent_sub_items = True
     if args.consolidate_empty_lines:
         config.consolidate_empty_lines = True
+    if args.reflow_help:
+        config.reflow_help_text = True
 
     linter = KconfigLinter(config)
     total_issues = 0

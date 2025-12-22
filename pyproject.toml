@@ -20,11 +20,12 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--cov --cov-report html"
+addopts = "--cov --cov-report html --cov-report term-missing"
 
 [tool.coverage.run]
 branch = true
 omit = [
     "tests/*",
 ]
+# required to get coverage reports when using subprocesses in tests
 patch = ["subprocess"]
