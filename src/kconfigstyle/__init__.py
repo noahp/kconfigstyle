@@ -154,15 +154,37 @@ class KconfigLinter:
             prev_was_empty = False
             stripped = line_no_newline.lstrip()
 
-            # Get line type, but if we're in help, treat everything as help text
-            # unless it's a clear top-level keyword that couldn't be help content
+            # Get line type, but if we're in help, check indentation to determine
+            # if we're still in the help block
             if in_help:
-                # Check if this looks like it could only be a top-level keyword
-                # (not indented, matches keyword pattern)
-                if not line_no_newline.startswith((" ", "\t")):
-                    # Non-indented line - check if it's a keyword that ends help
-                    line_type = self._get_line_type(line_no_newline)
-                    if line_type in [
+                # Calculate expected help text indentation
+                if self.config.use_spaces:
+                    base_indent = self.config.primary_indent_spaces
+                    if self.config.indent_sub_items:
+                        base_indent += indent_level * self.config.primary_indent_spaces
+                    expected_help_indent = " " * (
+                        base_indent + self.config.help_indent_spaces
+                    )
+                else:
+                    base_tabs = 1
+                    if self.config.indent_sub_items:
+                        base_tabs += indent_level
+                    expected_help_indent = (
+                        "\t" * base_tabs + " " * self.config.help_indent_spaces
+                    )
+
+                # Check if line starts with expected help indentation
+                if line_no_newline.startswith(expected_help_indent):
+                    # Line has proper help indentation - continue help block
+                    # (even if it looks like a keyword)
+                    line_type = "help_text"
+                else:
+                    # Indentation doesn't match expected help indent
+                    potential_line_type = self._get_line_type(line_no_newline)
+
+                    # Check if this is a keyword - keywords end help blocks
+                    # when they don't have help text indentation
+                    if potential_line_type in [
                         "config",
                         "menuconfig",
                         "choice",
@@ -175,33 +197,45 @@ class KconfigLinter:
                         "rsource",
                         "comment",
                     ]:
-                        # This is a keyword that ends the help block
+                        # Keyword without help indentation ends help block
                         if self.config.reflow_help_text and help_lines:
                             formatted.extend(
                                 self._reflow_help_text(help_lines, indent_level)
                             )
                             help_lines = []
                         in_help = False
+                        line_type = potential_line_type
+                        # End config block for certain keywords
+                        if line_type in [
+                            "config",
+                            "menuconfig",
+                            "menu",
+                            "if",
+                            "endif",
+                            "comment",
+                        ]:
+                            in_config_block = False
                     elif had_empty_before:
-                        # Non-keyword after blank line - this ends help block
+                        # Blank line before and indentation doesn't match - end help
                         if self.config.reflow_help_text and help_lines:
                             formatted.extend(
                                 self._reflow_help_text(help_lines, indent_level)
                             )
                             help_lines = []
                         in_help = False
+                        line_type = potential_line_type
+                        # End config block for certain line types
+                        if line_type in ["comment_line"]:
+                            in_config_block = False
                     else:
-                        # Non-indented but not a keyword and no blank before
-                        # Treat as help text (malformed input that we'll fix)
+                        # No blank before - treat as help text even if indentation is wrong
+                        # (formatter will fix it)
                         line_type = "help_text"
-                else:
-                    # Indented line in help - definitely help text
-                    line_type = "help_text"
             else:
                 # Not in help block - determine line type normally
-                line_type = self._get_line_type(line_no_newline)
-
-            # Update indent level (for end markers, do it before formatting)
+                line_type = self._get_line_type(
+                    line_no_newline
+                )  # Update indent level (for end markers, do it before formatting)
             if line_type in ["endmenu", "endif", "endchoice"] and indent_level > 0:
                 indent_level -= 1
 
@@ -594,6 +628,7 @@ class KconfigLinter:
         in_help = False
         indent_level = 0
         empty_line_count = 0
+        prev_was_empty = False
 
         for i, line in enumerate(lines, start=1):
             line_no_newline = line.rstrip("\n\r")
@@ -621,6 +656,7 @@ class KconfigLinter:
                             "Multiple consecutive empty lines (should be consolidated to one)",
                         )
                     )
+                prev_was_empty = True
             else:
                 empty_line_count = 0
 
@@ -639,26 +675,67 @@ class KconfigLinter:
             if not line.strip():
                 continue
 
-            # Detect line type
-            line_type = self._get_line_type(line_no_newline)
+            # Store and reset empty line flag
+            had_empty_before = prev_was_empty
+            prev_was_empty = False
 
-            # Update help text state BEFORE checking indentation
-            # This ensures we don't incorrectly check non-help lines as help text
+            # Detect line type - use same logic as _format_lines for help blocks
+            if in_help:
+                # Calculate expected help text indentation
+                if self.config.use_spaces:
+                    base_indent = self.config.primary_indent_spaces
+                    if self.config.indent_sub_items:
+                        base_indent += indent_level * self.config.primary_indent_spaces
+                    expected_help_indent = " " * (
+                        base_indent + self.config.help_indent_spaces
+                    )
+                else:
+                    base_tabs = 1
+                    if self.config.indent_sub_items:
+                        base_tabs += indent_level
+                    expected_help_indent = (
+                        "\t" * base_tabs + " " * self.config.help_indent_spaces
+                    )
+
+                # Check if line starts with expected help indentation
+                if line_no_newline.startswith(expected_help_indent):
+                    # Line has proper help indentation - still in help block
+                    line_type = "help_text"
+                else:
+                    # Indentation doesn't match expected help indent
+                    potential_line_type = self._get_line_type(line_no_newline)
+
+                    # Check if this is a keyword - keywords end help blocks
+                    # when they don't have help text indentation
+                    if potential_line_type in [
+                        "config",
+                        "menuconfig",
+                        "choice",
+                        "endchoice",
+                        "menu",
+                        "endmenu",
+                        "if",
+                        "endif",
+                        "source",
+                        "rsource",
+                        "comment",
+                    ]:
+                        # Keyword without help indentation ends help block
+                        in_help = False
+                        line_type = potential_line_type
+                    elif had_empty_before:
+                        # Blank line before and indentation doesn't match - end help
+                        in_help = False
+                        line_type = potential_line_type
+                    else:
+                        # No blank before - treat as help text even if indentation is wrong
+                        line_type = "help_text"
+            else:
+                line_type = self._get_line_type(line_no_newline)
+
+            # Update help text state
             if line_type == "help":
                 in_help = True
-            elif in_help and line_type in [
-                "config",
-                "menuconfig",
-                "choice",
-                "endchoice",
-                "menu",
-                "endmenu",
-                "if",
-                "endif",
-                "source",
-                "comment",
-            ]:
-                in_help = False
 
             # Check indentation
             if self.config.indent_sub_items:

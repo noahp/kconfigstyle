@@ -1,0 +1,7 @@
+config NETWORKING
+	bool "Enable networking"
+	help
+	  Enable network stack support for the application.
+	  This provides TCP/IP connectivity.
+
+	  config use this config!
