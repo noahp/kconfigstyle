@@ -128,14 +128,15 @@ class KconfigLinter:
 
             # Skip if empty
             if not line.strip():
-                # Empty line terminates help block
-                if in_help:
-                    if self.config.reflow_help_text and help_lines:
-                        formatted.extend(
-                            self._reflow_help_text(help_lines, indent_level)
-                        )
-                        help_lines = []
-                    in_help = False
+                # Empty lines within help text are allowed (don't terminate help block)
+                # Help text can contain blank lines followed by more indented text
+                # The help block only ends when we see a non-indented line after a blank
+
+                # If in help and reflow is enabled, treat blank line as paragraph separator
+                if in_help and self.config.reflow_help_text and help_lines:
+                    formatted.extend(self._reflow_help_text(help_lines, indent_level))
+                    help_lines = []
+                    # Don't set in_help = False here! Keep it active.
 
                 # Consolidate empty lines if configured
                 if self.config.consolidate_empty_lines:
@@ -147,6 +148,9 @@ class KconfigLinter:
                     prev_was_empty = True
                 continue
 
+            # Current line is not empty
+            # Store prev_was_empty before we reset it
+            had_empty_before = prev_was_empty
             prev_was_empty = False
             stripped = line_no_newline.lstrip()
 
@@ -156,7 +160,7 @@ class KconfigLinter:
                 # Check if this looks like it could only be a top-level keyword
                 # (not indented, matches keyword pattern)
                 if not line_no_newline.startswith((" ", "\t")):
-                    # Top-level line - check if it's a keyword that ends help
+                    # Non-indented line - check if it's a keyword that ends help
                     line_type = self._get_line_type(line_no_newline)
                     if line_type in [
                         "config",
@@ -171,7 +175,15 @@ class KconfigLinter:
                         "rsource",
                         "comment",
                     ]:
-                        # This ends the help block
+                        # This is a keyword that ends the help block
+                        if self.config.reflow_help_text and help_lines:
+                            formatted.extend(
+                                self._reflow_help_text(help_lines, indent_level)
+                            )
+                            help_lines = []
+                        in_help = False
+                    elif had_empty_before:
+                        # Non-keyword after blank line - this ends help block
                         if self.config.reflow_help_text and help_lines:
                             formatted.extend(
                                 self._reflow_help_text(help_lines, indent_level)
@@ -179,7 +191,8 @@ class KconfigLinter:
                             help_lines = []
                         in_help = False
                     else:
-                        # Top-level but not a keyword - treat as help text
+                        # Non-indented but not a keyword and no blank before
+                        # Treat as help text (malformed input that we'll fix)
                         line_type = "help_text"
                 else:
                     # Indented line in help - definitely help text

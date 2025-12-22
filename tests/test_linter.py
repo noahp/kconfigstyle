@@ -1836,3 +1836,39 @@ class TestHelpBlockTermination:
             assert "\nmodule-str = Memfault\n" in formatted
         finally:
             temp_path.unlink()
+
+    def test_blank_line_with_indented_continuation(self):
+        """Test that blank lines in help text followed by indented text continue the help block."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config CACHE_DOUBLEMAP\n",
+            '\tbool "Cache double-mapping support"\n',
+            "\tselect CACHE_HAS_MIRRORED_MEMORY_REGIONS\n",
+            "\tselect DEPRECATED\n",
+            "\thelp\n",
+            "\t  Double-mapping behavior where a pointer can be cheaply converted to\n",
+            "\t  point to the same cached/uncached memory at different locations.\n",
+            "\n",
+            "\t  This applies to intra-CPU multiprocessing incoherence and makes only\n",
+            "\t  sense when MP_MAX_NUM_CPUS > 1.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted_lines, _ = linter.format_file(temp_path)
+            formatted = "".join(formatted_lines)
+
+            # The blank line should be preserved
+            assert "\n\n" in formatted
+            # Text after blank line should still be formatted as help text (indented)
+            assert "\t  This applies to" in formatted
+            assert "\t  sense when MP_MAX_NUM_CPUS > 1.\n" in formatted
+        finally:
+            temp_path.unlink()
