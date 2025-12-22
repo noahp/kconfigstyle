@@ -5,7 +5,7 @@ description = "Simple formatter for Kconfig files"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
-license = { text = "MIT" }
+license = "MIT"
 
 [project.urls]
 Homepage = "https://github.com/noahp/kconfstyle"
