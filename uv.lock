@@ -137,7 +137,7 @@ wheels = [
 ]
 
 [[package]]
-name = "kconfstyle"
+name = "kconfigstyle"
 version = "0.2.3"
 source = { editable = "." }
 

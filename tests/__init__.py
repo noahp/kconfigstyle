@@ -1,1 +1,1 @@
-"""Tests for kconfstyle."""
+"""Tests for kconfigstyle."""

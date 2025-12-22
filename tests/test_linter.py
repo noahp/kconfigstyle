@@ -5,7 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from kconfstyle import KconfigLinter, LinterConfig
+from kconfigstyle import KconfigLinter, LinterConfig
 
 
 class TestZephyrStyle:
@@ -839,7 +839,7 @@ class TestEdgeCases:
 
     def test_lint_issue_string_representation(self):
         """Test LintIssue string formatting."""
-        from kconfstyle import LintIssue
+        from kconfigstyle import LintIssue
 
         issue_with_col = LintIssue(10, 5, "error", "Test message")
         assert str(issue_with_col) == "Line 10:5: [error] Test message"
@@ -1485,7 +1485,7 @@ class TestCLI:
 
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "kconfstyle", str(temp_path)],
+                [sys.executable, "-m", "kconfigstyle", str(temp_path)],
                 cwd=Path(__file__).parent.parent,
                 capture_output=True,
                 text=True,
@@ -1505,7 +1505,7 @@ class TestCLI:
 
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "kconfstyle", str(temp_path)],
+                [sys.executable, "-m", "kconfigstyle", str(temp_path)],
                 cwd=Path(__file__).parent.parent,
                 capture_output=True,
                 text=True,
@@ -1518,7 +1518,7 @@ class TestCLI:
     def test_cli_file_not_found(self):
         """Test CLI with non-existent file."""
         result = subprocess.run(
-            [sys.executable, "-m", "kconfstyle", "/nonexistent/file.Kconfig"],
+            [sys.executable, "-m", "kconfigstyle", "/nonexistent/file.Kconfig"],
             cwd=Path(__file__).parent.parent,
             capture_output=True,
             text=True,
@@ -1535,7 +1535,7 @@ class TestCLI:
 
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "kconfstyle", "--write", str(temp_path)],
+                [sys.executable, "-m", "kconfigstyle", "--write", str(temp_path)],
                 cwd=Path(__file__).parent.parent,
                 capture_output=True,
                 text=True,
@@ -1564,7 +1564,7 @@ class TestCLI:
                 [
                     sys.executable,
                     "-m",
-                    "kconfstyle",
+                    "kconfigstyle",
                     "--preset",
                     "espidf",
                     str(temp_path),
@@ -1591,7 +1591,7 @@ class TestCLI:
                 [
                     sys.executable,
                     "-m",
-                    "kconfstyle",
+                    "kconfigstyle",
                     "--max-line-length",
                     "50",
                     str(temp_path),
@@ -1615,7 +1615,7 @@ class TestCLI:
 
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "kconfstyle", "--verbose", str(temp_path)],
+                [sys.executable, "-m", "kconfigstyle", "--verbose", str(temp_path)],
                 cwd=Path(__file__).parent.parent,
                 capture_output=True,
                 text=True,
@@ -1640,7 +1640,13 @@ class TestCLI:
 
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "kconfstyle", str(temp_path1), str(temp_path2)],
+                [
+                    sys.executable,
+                    "-m",
+                    "kconfigstyle",
+                    str(temp_path1),
+                    str(temp_path2),
+                ],
                 cwd=Path(__file__).parent.parent,
                 capture_output=True,
                 text=True,
@@ -1663,7 +1669,7 @@ class TestCLI:
                 [
                     sys.executable,
                     "-m",
-                    "kconfstyle",
+                    "kconfigstyle",
                     "--use-spaces",
                     "--primary-indent",
                     "2",
@@ -1706,7 +1712,7 @@ class TestCLI:
                 [
                     sys.executable,
                     "-m",
-                    "kconfstyle",
+                    "kconfigstyle",
                     "--reflow-help",
                     "--max-line-length",
                     "60",

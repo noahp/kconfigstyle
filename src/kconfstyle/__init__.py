@@ -12,7 +12,7 @@ from pathlib import Path
 try:
     from importlib.metadata import version
 
-    __version__ = version("kconfstyle")
+    __version__ = version("kconfigstyle")
 except Exception:
     __version__ = "unknown"
 
@@ -854,13 +854,13 @@ Style Presets:
 
 Examples:
   # Lint with Zephyr preset
-  kconfstyle Kconfig
+  kconfigstyle Kconfig
 
   # Format file in-place with ESP-IDF preset
-  kconfstyle --write --preset espidf Kconfig
+  kconfigstyle --write --preset espidf Kconfig
 
   # Custom: spaces instead of tabs, 120 char lines
-  kconfstyle --use-spaces --max-line-length 120 --write Kconfig
+  kconfigstyle --use-spaces --max-line-length 120 --write Kconfig
         """,
     )
 

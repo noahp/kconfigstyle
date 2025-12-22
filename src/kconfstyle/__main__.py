@@ -1,4 +1,4 @@
-"""Allow running the package with `python -m kconfstyle`."""
+"""Allow running the package with `python -m kconfigstyle`."""
 
 import sys
 
