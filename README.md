@@ -1,3 +1,8 @@
+[![](https://img.shields.io/badge/GitHub-noahp/kconfstyle-8da0cb?style=flat-square&logo=github)](https://github.com/noahp/kconfstyle)
+[![](https://img.shields.io/github/actions/workflow/status/noahp/kconfstyle/ci.yml?style=flat-square&branch=main)](https://github.com/noahp/kconfstyle/actions?query=branch%3Amain+)
+[![](https://img.shields.io/pypi/v/kconfstyle?style=flat-square)](https://pypi.org/project/kconfstyle/)
+
+
 # kconfstyle
 
 A simple linter for Kconfig files, with support for Zephyr and ESP-IDF coding
