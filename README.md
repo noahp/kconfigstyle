@@ -2,6 +2,8 @@
 [![](https://img.shields.io/github/actions/workflow/status/noahp/kconfstyle/ci.yml?style=flat-square&branch=main)](https://github.com/noahp/kconfstyle/actions?query=branch%3Amain+)
 [![](https://img.shields.io/pypi/v/kconfstyle?style=flat-square)](https://pypi.org/project/kconfstyle/)
 
+> **NOTE** this package has been renamed from `kconfstyle` to `kconfigstyle`!
+> This package will no longer receive updates.
 
 # kconfstyle
 
