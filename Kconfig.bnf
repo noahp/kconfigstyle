@@ -1,0 +1,129 @@
+<kconfig_file> ::= <statement_list>
+
+<statement_list> ::= <statement> | <statement> <statement_list>
+
+<statement> ::= <config_entry>
+              | <menuconfig_entry>
+              | <choice_block>
+              | <menu_block>
+              | <if_block>
+              | <source_statement>
+              | <comment_statement>
+              | <comment_line>
+              | <empty_line>
+
+<config_entry> ::= "config" <identifier> <newline> <config_option_list>
+
+<menuconfig_entry> ::= "menuconfig" <identifier> <newline> <config_option_list>
+
+<config_option_list> ::= <config_option> | <config_option> <config_option_list> | ε
+
+<config_option> ::= <type_definition>
+                  | <prompt_option>
+                  | <default_option>
+                  | <depends_option>
+                  | <select_option>
+                  | <imply_option>
+                  | <range_option>
+                  | <help_block>
+                  | <comment_line>
+
+<type_definition> ::= <type> <prompt>
+                    | <type>
+
+<type> ::= "bool" | "tristate" | "string" | "int" | "hex"
+         | "def_bool" <expr>
+         | "def_tristate" <expr>
+
+<prompt> ::= <string> | <string> "if" <expr>
+
+<prompt_option> ::= "prompt" <string> | "prompt" <string> "if" <expr>
+
+<default_option> ::= "default" <expr> | "default" <expr> "if" <expr>
+
+<depends_option> ::= "depends on" <expr>
+
+<select_option> ::= "select" <identifier> | "select" <identifier> "if" <expr>
+
+<imply_option> ::= "imply" <identifier> | "imply" <identifier> "if" <expr>
+
+<range_option> ::= "range" <expr> <expr> | "range" <expr> <expr> "if" <expr>
+
+<help_block> ::= "help" <newline> <help_text>
+
+<help_text> ::= <indented_line> | <indented_line> <help_text>
+
+<choice_block> ::= "choice" <newline> <choice_option_list> <choice_entry_list> "endchoice" <newline>
+                 | "choice" <identifier> <newline> <choice_option_list> <choice_entry_list> "endchoice" <newline>
+
+<choice_option_list> ::= <choice_option> | <choice_option> <choice_option_list> | ε
+
+<choice_option> ::= <prompt_option>
+                  | <type_definition>
+                  | <default_option>
+                  | <depends_option>
+                  | <help_block>
+                  | <comment_line>
+
+<choice_entry_list> ::= <config_entry> | <config_entry> <choice_entry_list>
+
+<menu_block> ::= "menu" <string> <newline> <menu_option_list> <statement_list> "endmenu" <newline>
+
+<menu_option_list> ::= <depends_option> | <depends_option> <menu_option_list> | ε
+
+<if_block> ::= "if" <expr> <newline> <statement_list> "endif" <newline>
+
+<source_statement> ::= "source" <string> <newline>
+                     | "rsource" <string> <newline>
+                     | "osource" <string> <newline>
+                     | "orsource" <string> <newline>
+
+<comment_statement> ::= "comment" <string> <newline> <comment_option_list>
+
+<comment_option_list> ::= <depends_option> | <depends_option> <comment_option_list> | ε
+
+<expr> ::= <symbol>
+         | <string>
+         | <number>
+         | "(" <expr> ")"
+         | "!" <expr>
+         | <expr> "=" <expr>
+         | <expr> "!=" <expr>
+         | <expr> "<" <expr>
+         | <expr> "<=" <expr>
+         | <expr> ">" <expr>
+         | <expr> ">=" <expr>
+         | <expr> "&&" <expr>
+         | <expr> "||" <expr>
+         | <symbol> "=" <symbol>
+         | <symbol> "!=" <symbol>
+
+<symbol> ::= <identifier>
+           | "y" | "m" | "n"
+
+<comment_line> ::= "#" <text> <newline>
+
+<identifier> ::= <letter> | <identifier> <letter> | <identifier> <digit> | <identifier> "_"
+
+<string> ::= '"' <text> '"'
+
+<number> ::= <digit> | <number> <digit>
+           | "0x" <hex_digits>
+
+<hex_digits> ::= <hex_digit> | <hex_digits> <hex_digit>
+
+<hex_digit> ::= <digit> | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F"
+
+<letter> ::= "a" | "b" | ... | "z" | "A" | "B" | ... | "Z"
+
+<digit> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+
+<indented_line> ::= <whitespace> <text> <newline>
+
+<whitespace> ::= " " | "\t" | <whitespace> " " | <whitespace> "\t"
+
+<text> ::= <any_character> | <text> <any_character>
+
+<newline> ::= "\n"
+
+<empty_line> ::= <newline>
