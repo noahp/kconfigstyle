@@ -8,6 +8,7 @@ This implementation uses a parser to build an AST, then formats by traversing th
 import argparse
 import re
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -315,7 +316,7 @@ class KconfigParser:
         # Config/menuconfig
         if stripped.startswith("config "):
             return self._parse_config_entry()
-        
+
         if stripped.startswith("menuconfig "):
             return self._parse_menuconfig_entry()
 
@@ -637,7 +638,6 @@ class KconfigParser:
     def _parse_help_block(self) -> HelpText:
         """Parse a help text block."""
         node = HelpText(line_number=self.current_line_num)
-        help_line_num = self.current_line_num
         self._advance()  # Skip 'help' line
 
         # Determine help text indentation from first non-empty line
@@ -761,7 +761,7 @@ class KconfigParser:
             if stripped.startswith("config "):
                 node.entries.append(self._parse_config_entry())
                 continue
-            
+
             if stripped.startswith("menuconfig "):
                 node.entries.append(self._parse_menuconfig_entry())
                 continue
@@ -1203,29 +1203,31 @@ class KconfigFormatter:
         if current_para:
             paragraphs.append(current_para)
 
-        # Reflow each paragraph
+        # Reflow each paragraph using textwrap
         for para in paragraphs:
             if not para:
                 result.append("")
                 continue
 
-            # Join and reflow
+            # Join paragraph into single text
             text = " ".join(para)
-            words = text.split()
 
-            if not words:
+            if not text.strip():
                 continue
 
-            current_line = words[0]
-            for word in words[1:]:
-                if len(current_line) + 1 + len(word) <= available_width:
-                    current_line += " " + word
-                else:
-                    result.append(f"{indent}{current_line}")
-                    current_line = word
+            # Use textwrap.fill() to reflow the text
+            wrapped = textwrap.fill(
+                text,
+                width=available_width,
+                initial_indent="",
+                subsequent_indent="",
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
 
-            if current_line:
-                result.append(f"{indent}{current_line}")
+            # Add indent to each line
+            for line in wrapped.split("\n"):
+                result.append(f"{indent}{line}")
 
         return result
 
@@ -1239,23 +1241,18 @@ class KconfigFormatter:
             self.lines.append(f"{indent}choice")
 
         # Format options
-        prev_was_empty = False
         for option in node.options:
             if isinstance(option, EmptyLine):
                 # Skip empty lines in choice options - we'll add proper spacing
                 continue
             elif isinstance(option, Comment):
                 self._format_comment(option, indent_level, in_config=True)
-                prev_was_empty = False
             elif isinstance(option, HelpText):
                 self._format_help_text(option, indent_level)
-                prev_was_empty = False
             elif isinstance(option, ConfigOption):
                 self._format_config_option(option, indent_level)
-                prev_was_empty = False
             elif isinstance(option, UnknownLine):
                 self._format_unknown_line(option, indent_level, in_config=True)
-                prev_was_empty = False
 
         # Format entries (config, menuconfig, if blocks, etc.)
         # Check if there are any non-empty-line options before entries
@@ -1267,7 +1264,7 @@ class KconfigFormatter:
             # - Before subsequent ones (except for nested if blocks)
             if i > 0 or has_real_options:
                 self.lines.append("")
-            
+
             # Format based on entry type
             next_level = indent_level + (1 if self.config.indent_sub_items else 0)
             if isinstance(entry, ConfigEntry):
@@ -1464,6 +1461,7 @@ class KconfigLinter:
         # Check indentation issues (pass 2 - needs context)
         in_help_block = False
         for i, line in enumerate(lines, 1):
+            print("linting line:", line)
             line_no_newline = line.rstrip("\n\r")
             if not line_no_newline.strip():
                 continue
@@ -1572,6 +1570,7 @@ class KconfigLinter:
         """Lint AST nodes for structural issues."""
         for node in nodes:
             if isinstance(node, ConfigEntry):
+                print(node)
                 self._lint_config_entry(node)
             elif isinstance(node, ChoiceEntry):
                 self._lint_choice(node)
@@ -1620,8 +1619,7 @@ class KconfigLinter:
 
     def _lint_choice(self, node: ChoiceEntry):
         """Lint a choice block."""
-        for entry in node.entries:
-            self._lint_config_entry(entry)
+        self._lint_ast(node.entries, None)
 
     def _lint_menu(self, node: MenuEntry):
         """Lint a menu block."""

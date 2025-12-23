@@ -3439,7 +3439,7 @@ class TestCoverageImprovements:
         try:
             formatted, _ = linter.format_file(temp_path)
             formatted_text = "".join(formatted)
-            
+
             # Verify structure is preserved
             assert "choice BUILD_TYPE" in formatted_text
             assert "config USE_TYPE_A" in formatted_text
@@ -3448,13 +3448,12 @@ class TestCoverageImprovements:
             assert "choice TYPE_B_VARIANT" in formatted_text
             assert "config VARIANT_1" in formatted_text
             assert "config VARIANT_2" in formatted_text
-            
+
             # Verify proper closing
             assert formatted_text.count("endchoice") == 2
             assert formatted_text.count("endif") == 1
-            
+
             # Verify no duplicate or missing blank lines around nested structures
             assert "\n\n\n" not in formatted_text
         finally:
             temp_path.unlink()
-

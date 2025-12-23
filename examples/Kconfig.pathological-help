@@ -1,8 +1,12 @@
 config NETWORKING
 	bool "Enable networking"
 	help
-	  Enable network stack support for the application.
-	  This provides TCP/IP connectivity.
+	  Adds support for performing OTA updates via MCUboot. If an update is available,
+	  the binary will be downloaded and installed in the secondary slot(slot1_partition).
+	  By default, the device will be rebooted into the new firmware. Users can customize
+	  the behavior after the update is downloaded by providing a custom implementation
+	  of memfault_zephyr_fota_download_callback() and setting MEMFAULT_ZEPHYR_FOTA_DOWNLOAD_CALLBACK_CUSTOM=y.
+	  For information on release management with Memfault: https://mflt.io/release-mgmt.
 
 	  config use this config!
 
