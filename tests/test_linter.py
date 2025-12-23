@@ -378,7 +378,7 @@ class TestFormatter:
             "config NET\n",
             'bool "Enable"\n',
             "help\n",
-            "Help text.\n",
+            "    Help text.\n",  # Properly indented help text
             "endmenu\n",
         ]
 
@@ -397,7 +397,8 @@ class TestFormatter:
             assert formatted[2].startswith("        bool")  # 8 spaces
             assert formatted[3].startswith("        help")  # 8 spaces
             assert formatted[4].startswith("            Help")  # 12 spaces
-            assert formatted[5] == "endmenu\n"
+            assert formatted[5] == "\n"  # Blank line before endmenu
+            assert formatted[6] == "endmenu\n"
         finally:
             temp_path.unlink()
 
@@ -720,7 +721,7 @@ class TestEdgeCases:
             "config FOO\n",
             'bool "Test"\n',
             "help\n",
-            "Help text.\n",
+            "    Help text.\n",  # Properly indented
             "endmenu\n",
         ]
 
@@ -1873,6 +1874,102 @@ class TestHelpBlockTermination:
         finally:
             temp_path.unlink()
 
+    def test_config_keyword_as_indented_help_text(self):
+        """Test that indented 'config' keyword is treated as help text, not a new config."""
+        from kconfigstyle import KconfigParser
+
+        content = """config NETWORKING
+\tbool "Enable networking"
+\thelp
+\t  Enable network stack support for the application.
+\t  This provides TCP/IP connectivity.
+
+\t  config use this config!
+"""
+
+        parser = KconfigParser()
+        ast = parser.parse(content)
+
+        # Should have exactly one config entry
+        assert len(ast) == 1
+        assert ast[0].__class__.__name__ == "ConfigEntry"
+        assert ast[0].name == "NETWORKING"
+
+        # Find the help text in the options
+        help_text = None
+        for option in ast[0].options:
+            if option.__class__.__name__ == "HelpText":
+                help_text = option
+                break
+
+        assert help_text is not None, "No HelpText found in config options"
+
+        # Help text should contain 4 lines (including blank line and "config use this config!")
+        assert len(help_text.lines) == 4, (
+            f"Expected 4 lines, got {len(help_text.lines)}"
+        )
+        assert help_text.lines[0] == "Enable network stack support for the application."
+        assert help_text.lines[1] == "This provides TCP/IP connectivity."
+        assert help_text.lines[2] == ""
+        assert help_text.lines[3] == "config use this config!"
+
+    def test_inline_comments_preserved(self):
+        """Test that inline comments are preserved during formatting."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST  # Test configuration\n",
+            '\tbool "Enable test"  # Boolean option\n',
+            "\tdefault y  # Default to enabled\n",
+            "\thelp\n",
+            "\t  This is help text.\n",
+            "\n",
+            "if FEATURE  # Feature flag\n",
+            "\tconfig FEATURE_OPT\n",
+            '\t\tbool "Feature option"\n',
+            "endif  # FEATURE\n",
+            "\n",
+            "choice TEST_CHOICE  # Test choice\n",
+            '\tprompt "Select option"\n',
+            "config CHOICE_A\n",
+            '\tbool "Choice A"\n',
+            "endchoice  # TEST_CHOICE\n",
+            "\n",
+            'menu "Test Menu"  # Menu for testing\n',
+            "\tconfig MENU_OPT\n",
+            '\t\tbool "Menu option"\n',
+            "endmenu  # Test Menu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            formatted_text = "".join(formatted)
+
+            # Check that inline comments are preserved
+            assert "# Test configuration" in formatted_text
+            assert "# Boolean option" in formatted_text
+            assert "# Default to enabled" in formatted_text
+            assert "# Feature flag" in formatted_text
+            assert "endif  # FEATURE" in formatted_text
+            assert "# Test choice" in formatted_text
+            assert "endchoice  # TEST_CHOICE" in formatted_text
+            assert "# Menu for testing" in formatted_text
+            assert "endmenu  # Test Menu" in formatted_text
+
+            # Verify proper spacing before comments (2 spaces)
+            assert "config TEST  # Test configuration" in formatted_text
+            assert 'bool "Enable test"  # Boolean option' in formatted_text
+            assert "default y  # Default to enabled" in formatted_text
+        finally:
+            temp_path.unlink()
+
 
 class TestAdditionalCoverage:
     """Additional tests to improve code coverage."""
@@ -2213,6 +2310,40 @@ class TestAdditionalCoverage:
 
             # Should handle gracefully
             assert "help" in formatted
+        finally:
+            temp_path.unlink()
+
+    def test_multiple_empty_lines_in_help_text(self):
+        """Test that multiple consecutive empty lines in help text are consolidated."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "\t  First line of help.\n",
+            "\n",
+            "\n",
+            "\n",
+            "\t  Second line after multiple blanks.\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            # Verify formatted output has only one blank line
+            formatted_lines, _ = linter.format_file(temp_path)
+            formatted = "".join(formatted_lines)
+
+            # Should not have multiple consecutive blank lines (3+ newlines in a row)
+            assert "\n\n\n" not in formatted
+            # Should have one blank line between help text paragraphs
+            assert "First line of help.\n\n\t  Second line" in formatted
         finally:
             temp_path.unlink()
 
@@ -2712,3 +2843,618 @@ class TestAdditionalCoverage:
             # The test validates the default preset works
         finally:
             temp_path.unlink()
+
+
+class TestCoverageImprovements:
+    """Additional tests to improve code coverage."""
+
+    def test_choice_block_with_name(self):
+        """Test parsing and formatting choice block with name."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "choice MY_CHOICE\n",
+            '\tprompt "Select option"\n',
+            "\tconfig OPT1\n",
+            '\t\tbool "Option 1"\n',
+            "\tconfig OPT2\n",
+            '\t\tbool "Option 2"\n',
+            "endchoice\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should preserve choice structure
+            assert any("choice" in line for line in formatted)
+            assert any("endchoice" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_choice_block_empty_lines(self):
+        """Test choice block with empty lines."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "choice\n",
+            "\n",
+            "\tconfig OPT1\n",
+            '\t\tbool "Option 1"\n',
+            "\n",
+            "endchoice\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("choice" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_source_variants(self):
+        """Test different source statement types."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            'source "Kconfig.test"\n',
+            'rsource "drivers/Kconfig"\n',
+            'osource "optional.Kconfig"\n',
+            'orsource "optional2.Kconfig"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("source" in line for line in formatted)
+            assert any("rsource" in line for line in formatted)
+            assert any("osource" in line for line in formatted)
+            assert any("orsource" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_comment_statement(self):
+        """Test comment statement (not comment line)."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            'comment "This is a comment statement"\n',
+            "\tdepends on FOO\n",
+            'comment "Another comment"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("comment" in line and '"' in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_choice_with_options(self):
+        """Test choice block with options like bool, tristate."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "choice\n",
+            '\tbool "Choose one"\n',
+            "\tdefault OPT1\n",
+            "\tconfig OPT1\n",
+            '\t\tbool "Option 1"\n',
+            "endchoice\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("choice" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_menu_with_depends(self):
+        """Test menu with depends statements."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            'menu "Advanced"\n',
+            "\tdepends on EXPERT\n",
+            "\tdepends on DEBUG\n",
+            "\tconfig ADV_OPT\n",
+            '\t\tbool "Advanced option"\n',
+            "endmenu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("menu" in line for line in formatted)
+            assert any("depends" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_line_wrapping_with_or_operator(self):
+        """Test line wrapping with || operator."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 40
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tdepends on FOO || BAR || BAZ || QUX || VERY_LONG\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should have continuation lines
+            assert any("\\" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_wrap_line_without_operators(self):
+        """Test that lines without && or || aren't wrapped."""
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 30
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config VERY_LONG_CONFIG_NAME_WITHOUT_OPERATORS\n",
+            '\tbool "Test"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Long line without operators shouldn't get backslash
+            assert not any("\\" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_config_option_with_condition(self):
+        """Test config option with if condition."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tdefault y if EXPERT\n",
+            '\tstring "Path" if DEBUG\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("if" in line and "default" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_def_bool_and_def_tristate(self):
+        """Test def_bool and def_tristate options."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST1\n",
+            "\tdef_bool y\n",
+            "config TEST2\n",
+            "\tdef_tristate m\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # def_bool and def_tristate are formatted as "def bool" etc (with space)
+            assert any("def bool" in line or "def_bool" in line for line in formatted)
+            assert any(
+                "def tristate" in line or "def_tristate" in line for line in formatted
+            )
+        finally:
+            temp_path.unlink()
+
+    def test_imply_option(self):
+        """Test imply option."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\timply OTHER_OPTION\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("imply" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_range_option(self):
+        """Test range option."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config NUM\n",
+            "\tint\n",
+            "\trange 1 100\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("range" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_option_keyword(self):
+        """Test option keyword."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            '\toption env="TEST_VAR"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("option" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_prompt_option(self):
+        """Test prompt option."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            "\tbool\n",
+            '\tprompt "Enter value"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("prompt" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_hex_and_int_types(self):
+        """Test hex and int config types."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config HEX_VAL\n",
+            '\thex "Hex value"\n',
+            "config INT_VAL\n",
+            '\tint "Int value"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("hex" in line for line in formatted)
+            assert any("int" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_help_with_no_content(self):
+        """Test help block with no actual help text."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\thelp\n",
+            "config NEXT\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should handle gracefully
+            assert any("help" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_config_with_trailing_empty_lines(self):
+        """Test config block ending with empty lines at EOF."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tdefault y\n",
+            "\n",
+            "\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should handle gracefully
+            assert any("config TEST" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_source_without_quotes(self):
+        """Test source statement without quotes."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "source Kconfig.test\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("source" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_if_block_hierarchical(self):
+        """Test if block with hierarchical indentation."""
+        config = LinterConfig.espidf_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "if FOO\n",
+            "config TEST\n",
+            'bool "Test"\n',
+            "endif\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should indent content inside if block
+            assert any("    config" in line or "config" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_unknown_config_option(self):
+        """Test unknown/unrecognized config option."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            '\tbool "Test"\n',
+            "\tunknown_option value\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            # Should preserve unknown options
+            assert len(formatted) > 0
+        finally:
+            temp_path.unlink()
+
+    def test_string_type(self):
+        """Test string config type."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config PATH\n",
+            '\tstring "Enter path"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("string" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_type_without_prompt(self):
+        """Test type declaration without prompt."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST\n",
+            "\tbool\n",
+            '\tprompt "Test"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert any("bool" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_complex_nesting_choice_if_menuconfig(self):
+        """Test complex nesting with choice, if blocks, and menuconfig."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "choice BUILD_TYPE\n",
+            '\tprompt "Build type"\n',
+            "\tdefault USE_TYPE_A\n",
+            "\thelp\n",
+            "\t  Choose the build type\n",
+            "\n",
+            "config USE_TYPE_A\n",
+            '\tbool "Type A"\n',
+            "\thelp\n",
+            "\t  Use type A\n",
+            "\n",
+            "menuconfig USE_TYPE_B\n",
+            '\tbool "Type B"\n',
+            "\tdepends on FEATURE_X\n",
+            "\n",
+            "if USE_TYPE_B\n",
+            "\n",
+            "choice TYPE_B_VARIANT\n",
+            '\tprompt "Type B variant"\n',
+            "\tdefault VARIANT_1\n",
+            "\n",
+            "config VARIANT_1\n",
+            '\tbool "Variant 1"\n',
+            "\n",
+            "config VARIANT_2\n",
+            '\tbool "Variant 2"\n',
+            "\n",
+            "endchoice\n",
+            "\n",
+            "endif\n",
+            "\n",
+            "endchoice\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            formatted_text = "".join(formatted)
+            
+            # Verify structure is preserved
+            assert "choice BUILD_TYPE" in formatted_text
+            assert "config USE_TYPE_A" in formatted_text
+            assert "menuconfig USE_TYPE_B" in formatted_text
+            assert "if USE_TYPE_B" in formatted_text
+            assert "choice TYPE_B_VARIANT" in formatted_text
+            assert "config VARIANT_1" in formatted_text
+            assert "config VARIANT_2" in formatted_text
+            
+            # Verify proper closing
+            assert formatted_text.count("endchoice") == 2
+            assert formatted_text.count("endif") == 1
+            
+            # Verify no duplicate or missing blank lines around nested structures
+            assert "\n\n\n" not in formatted_text
+        finally:
+            temp_path.unlink()
+

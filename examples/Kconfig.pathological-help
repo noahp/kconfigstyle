@@ -6,6 +6,12 @@ config NETWORKING
 
 	  config use this config!
 
+
+
+if YOLO
+
+menu "Some choice settings"
+
 choice SOME_CHOICE
 	prompt "Select a choice"
 	default SOME_CHOICE_OPTION_A if YOLO
@@ -21,9 +27,10 @@ config SOME_CHOICE_OPTION_B
 	bool "Option B"
 	help
 	  This is option B for the choice.
+
 endchoice
 
-if YOLO
+endmenu # Some choice settings
 
 	config YOLO_FEATURE
 		bool "Enable YOLO feature"
@@ -35,3 +42,8 @@ if YOLO
 		  memfault_metrics_heartbeat_config.def
 		  memfault_trace_reason_user_config.def
 endif  # YOLO
+
+menuconfig ADVANCED_SETTINGS
+    bool "Enable advanced settings"
+    help
+      Enable advanced settings for power users.
