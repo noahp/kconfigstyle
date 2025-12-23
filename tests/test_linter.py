@@ -2030,9 +2030,10 @@ class TestAdditionalCoverage:
             # Should have two separate paragraphs
             lines_list = formatted.split("\n")
             help_lines = [
-                l
-                for l in lines_list
-                if l.strip() and not l.strip().startswith(("config", "bool", "help"))
+                line
+                for line in lines_list
+                if line.strip()
+                and not line.strip().startswith(("config", "bool", "help"))
             ]
 
             # Should have reflowed paragraphs
@@ -2391,7 +2392,7 @@ class TestAdditionalCoverage:
         import os
 
         config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
+        _ = KconfigLinter(config)
 
         # Create a temporary file
         with tempfile.NamedTemporaryFile(
@@ -2703,7 +2704,7 @@ class TestAdditionalCoverage:
             except SystemExit:
                 pass
             finally:
-                output = sys.stdout.getvalue()
+                _ = sys.stdout.getvalue()
                 sys.stdout = old_stdout
                 sys.argv = old_argv
 
