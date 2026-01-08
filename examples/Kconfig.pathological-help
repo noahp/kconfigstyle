@@ -29,6 +29,8 @@ config SOME_CHOICE_OPTION_A
 	  This is option A for the choice.
 config SOME_CHOICE_OPTION_B
 	bool "Option B"
+
+
 	help
 	  This is option B for the choice.
 

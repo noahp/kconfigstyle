@@ -2,11 +2,46 @@
 [![](https://img.shields.io/github/actions/workflow/status/noahp/kconfigstyle/ci.yml?style=flat-square&branch=main)](https://github.com/noahp/kconfigstyle/actions?query=branch%3Amain+)
 [![](https://img.shields.io/pypi/v/kconfigstyle?style=flat-square)](https://pypi.org/project/kconfigstyle/)
 
+# ✨ kconfigstyle
 
-# kconfigstyle
+A simple style linter + formatter for Kconfig files, with support for Zephyr and
+ESP-IDF style conventions.
 
-A simple linter + formatter for Kconfig files, with support for Zephyr and ESP-IDF
-style conventions.
+Example:
+
+```bash
+❯ uvx kconfigstyle --write --reflow-help --consolidate-empty-lines --max-line-length 80 Kconfig
+```
+
+Before:
+
+```bash
+# incorrect and inconsistent indentation, spare newline, and unwrapped help text
+config MY_OPTION
+  bool "Enable my option" if ANOTHER_OPTION
+
+
+    help
+      Extra long bit of help text that should be reflowed to fit within the maximum line length specified by the style guide.
+
+      This is the second line of the help text.
+```
+
+After:
+
+```bash
+# properly indented, consolidated newlines, and wrapped help text
+config MY_OPTION
+	bool "Enable my option" if ANOTHER_OPTION
+
+	help
+	  Extra long bit of help text that should be reflowed to fit within the
+	  maximum line length specified by the style guide.
+
+	  This is the second line of the help text.
+```
+
+## Background
 
 The "Kconfig language" is defined here:
 
@@ -71,7 +106,8 @@ include:
   Use spaces instead of tabs for indentation
 
 - `--primary-indent PRIMARY_INDENT`
-  Number of spaces for primary indentation (default: 4)
+  Number of spaces for primary indentation (default: 4), only applies when
+  `--use-spaces` is set
 
 - `--help-indent HELP_INDENT`
   Number of extra spaces for help text indentation (default: 2)
