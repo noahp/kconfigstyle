@@ -1461,7 +1461,6 @@ class KconfigLinter:
         # Check indentation issues (pass 2 - needs context)
         in_help_block = False
         for i, line in enumerate(lines, 1):
-            print("linting line:", line)
             line_no_newline = line.rstrip("\n\r")
             if not line_no_newline.strip():
                 continue
@@ -1570,7 +1569,6 @@ class KconfigLinter:
         """Lint AST nodes for structural issues."""
         for node in nodes:
             if isinstance(node, ConfigEntry):
-                print(node)
                 self._lint_config_entry(node)
             elif isinstance(node, ChoiceEntry):
                 self._lint_choice(node)
