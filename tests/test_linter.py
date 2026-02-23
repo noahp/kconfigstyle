@@ -3089,6 +3089,10 @@ class TestCoverageImprovements:
             "\tdef_bool y\n",
             "config TEST2\n",
             "\tdef_tristate m\n",
+            "config TEST3\n",
+            "\tdef_bool y\n",
+            "\thelp\n",
+            "\t\tTEST3 config\n",
         ]
 
         with tempfile.NamedTemporaryFile(
@@ -3099,10 +3103,9 @@ class TestCoverageImprovements:
 
         try:
             formatted, _ = linter.format_file(temp_path)
-            # def_bool and def_tristate are formatted as "def bool" etc (with space)
-            assert any("def bool" in line or "def_bool" in line for line in formatted)
+            assert any("def_bool" in line for line in formatted)
             assert any(
-                "def tristate" in line or "def_tristate" in line for line in formatted
+                "def_tristate" in line for line in formatted
             )
         finally:
             temp_path.unlink()
