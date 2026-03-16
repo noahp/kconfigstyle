@@ -1132,6 +1132,8 @@ class KconfigFormatter:
                 line = f"{indent}{node.option_type} {node.value}"
             else:
                 line = f"{indent}{node.option_type}"
+        elif node.option_type in ["def_bool", "def_tristate"]:
+            line = f"{indent}{node.option_type} {node.value}"
         else:
             line = f"{indent}{node.option_type.replace('_', ' ')} {node.value}"
 
