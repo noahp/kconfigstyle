@@ -5,7 +5,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from kconfigstyle import KconfigLinter, LinterConfig
+from kconfigstyle import (
+    Comment,
+    ConfigEntry,
+    KconfigLinter,
+    KconfigParser,
+    LinterConfig,
+    MenuEntry,
+)
 
 
 class TestZephyrStyle:
@@ -1430,6 +1437,50 @@ class TestCommentIndentation:
             )
         finally:
             temp_path.unlink()
+
+    def test_comment_after_help_belongs_to_next_config(self):
+        """A comment following a blank line after a config's help block (at the
+        config keyword's own indent) introduces the *next* config and must not be
+        absorbed into the previous config's options. Regression for the case in
+        examples/Kconfig.comment."""
+        content = (
+            'menu "Memfault Configuration"\n'
+            "\n"
+            "    config FIRST\n"
+            '        bool "First"\n'
+            "        help\n"
+            "            Help text for the first config.\n"
+            "\n"
+            "    # Comment introducing the second config\n"
+            "    config SECOND\n"
+            '        bool "Second"\n'
+            "\n"
+            "endmenu\n"
+        )
+
+        statements = KconfigParser().parse(content)
+
+        menu = next(s for s in statements if isinstance(s, MenuEntry))
+        first = next(
+            s
+            for s in menu.statements
+            if isinstance(s, ConfigEntry) and s.name == "FIRST"
+        )
+        # The comment must NOT have been swallowed into FIRST's options.
+        assert not any(isinstance(opt, Comment) for opt in first.options), (
+            "comment leading the next config was wrongly absorbed into the "
+            "previous config's options"
+        )
+
+        # It should appear as a sibling, immediately before the SECOND config.
+        menu_kinds = [type(s).__name__ for s in menu.statements]
+        comments = [s for s in menu.statements if isinstance(s, Comment)]
+        assert len(comments) == 1, f"expected one sibling comment, got {menu_kinds}"
+        comment_idx = menu.statements.index(comments[0])
+        following = menu.statements[comment_idx + 1]
+        assert isinstance(following, ConfigEntry) and following.name == "SECOND", (
+            f"comment should immediately precede SECOND, got {menu_kinds}"
+        )
 
     def test_nested_comment_indentation(self):
         """Test comment indentation in nested structures."""

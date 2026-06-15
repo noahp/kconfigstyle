@@ -1,0 +1,20 @@
+if MEMFAULT
+
+    menu "Memfault Configuration"
+
+        config MEMFAULT_ENABLE_REBOOT_DIAG_DUMP
+            bool "Pretty print reboot reason on boot"
+            default y
+            help
+                Print out the reboot reason, eg "Watchdog", on boot. Adds a few
+                hundred bytes of code space.
+
+        # HTTPS Periodic Upload
+        config MEMFAULT_HTTP_PERIODIC_UPLOAD
+            bool "Enable a dedicated thread to periodically upload Memfault data over HTTPS"
+            default n
+            depends on ESP_HTTP_CLIENT_ENABLE_HTTPS
+
+    endmenu  # Memfault Configuration
+
+endif  # MEMFAULT
