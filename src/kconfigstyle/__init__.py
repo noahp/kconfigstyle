@@ -366,6 +366,14 @@ class KconfigParser:
             line_number=self.current_line_num,
             inline_comment=inline_comment,
         )
+
+        # Track the indentation level of the config entry itself. A blank line
+        # followed by content at (or below) this level marks the end of the
+        # config; any leading comment there belongs to the next entry, not this
+        # one. seen_content guards against ending before any options are parsed.
+        config_indent = len(line) - len(stripped)
+        seen_content = False
+
         self._advance()
 
         # Parse options until we hit a structural keyword or end
@@ -389,6 +397,12 @@ class KconfigParser:
                         if peek_line[0] not in (" ", "\t"):
                             # After blank lines, unindented content ends the config
                             # (even if it's a comment or config option keyword)
+                            return node
+                        # Indented content at (or below) the config keyword's own
+                        # level is a sibling - e.g. a comment introducing the next
+                        # config - so end this config entry.
+                        peek_indent = len(peek_line) - len(peek_stripped)
+                        if seen_content and peek_indent <= config_indent:
                             return node
                         found_content = True
                         break
@@ -417,6 +431,7 @@ class KconfigParser:
 
             # Comment within config
             if stripped.startswith("#"):
+                seen_content = True
                 text = stripped[1:].strip() if len(stripped) > 1 else ""
                 node.options.append(
                     Comment(text=text, line_number=self.current_line_num)
@@ -426,12 +441,14 @@ class KconfigParser:
 
             # Help block
             if stripped.startswith("help"):
+                seen_content = True
                 node.options.append(self._parse_help_block())
                 continue
 
             # Config option
             option = self._parse_config_option()
             if option:
+                seen_content = True
                 node.options.append(option)
             else:
                 # Unknown line within config - preserve it
@@ -459,6 +476,13 @@ class KconfigParser:
             line_number=self.current_line_num,
             inline_comment=inline_comment,
         )
+
+        # See _parse_config_entry for the rationale behind config_indent /
+        # seen_content: a blank line followed by content at (or below) the
+        # config keyword's own indent marks the end of this entry.
+        config_indent = len(line) - len(stripped)
+        seen_content = False
+
         self._advance()
 
         # Parse options until we hit a structural keyword or end
@@ -482,6 +506,12 @@ class KconfigParser:
                         if peek_line[0] not in (" ", "\t"):
                             # After blank lines, unindented content ends the config
                             # (even if it's a comment or config option keyword)
+                            return node
+                        # Indented content at (or below) the config keyword's own
+                        # level is a sibling - e.g. a comment introducing the next
+                        # config - so end this config entry.
+                        peek_indent = len(peek_line) - len(peek_stripped)
+                        if seen_content and peek_indent <= config_indent:
                             return node
                         found_content = True
                         break
@@ -510,6 +540,7 @@ class KconfigParser:
 
             # Comment within config
             if stripped.startswith("#"):
+                seen_content = True
                 text = stripped[1:].strip() if len(stripped) > 1 else ""
                 node.options.append(
                     Comment(text=text, line_number=self.current_line_num)
@@ -519,12 +550,14 @@ class KconfigParser:
 
             # Help block
             if stripped.startswith("help"):
+                seen_content = True
                 node.options.append(self._parse_help_block())
                 continue
 
             # Config option
             option = self._parse_config_option()
             if option:
+                seen_content = True
                 node.options.append(option)
             else:
                 # Unknown line within config - preserve it
@@ -661,6 +694,14 @@ class KconfigParser:
                     # If next line is unindented and not empty, end help
                     if next_line[0] not in (" ", "\t") and next_line.strip():
                         break
+                    # If next line dedents past the help text, the help block is
+                    # over. Stop here without consuming the blank line so the
+                    # parent can attribute any following comment to the next entry
+                    # rather than this one.
+                    if help_indent is not None and next_stripped:
+                        next_indent = len(next_line) - len(next_stripped)
+                        if next_indent < help_indent:
+                            break
 
                 node.lines.append("")
                 self._advance()
