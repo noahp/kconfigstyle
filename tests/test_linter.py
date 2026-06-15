@@ -1444,16 +1444,16 @@ class TestCommentIndentation:
         absorbed into the previous config's options. Regression for the case in
         examples/Kconfig.comment."""
         content = (
-            "menu \"Memfault Configuration\"\n"
+            'menu "Memfault Configuration"\n'
             "\n"
             "    config FIRST\n"
-            "        bool \"First\"\n"
+            '        bool "First"\n'
             "        help\n"
             "            Help text for the first config.\n"
             "\n"
             "    # Comment introducing the second config\n"
             "    config SECOND\n"
-            "        bool \"Second\"\n"
+            '        bool "Second"\n'
             "\n"
             "endmenu\n"
         )
