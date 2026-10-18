@@ -116,10 +116,10 @@ class HelpText(ASTNode):
 
 @dataclass
 class ConfigOption(ASTNode):
-    """A config option like 'bool', 'default', 'depends on', etc."""
+    """A config option like 'bool', 'default', 'depends on', 'visible if', etc."""
 
     line_number: int = 0
-    option_type: str = ""  # 'bool', 'default', 'depends_on', 'select', etc.
+    option_type: str = ""  # 'bool', 'default', 'depends_on', 'visible_if', 'select'
     value: str = ""  # The rest of the line
     condition: str = ""  # Optional 'if' condition
 
@@ -129,7 +129,7 @@ class ConfigEntry(ASTNode):
     """A config or menuconfig entry."""
 
     line_number: int = 0
-    config_type: Literal["config", "menuconfig"] = "config"
+    config_type: Literal["config", "configdefault", "menuconfig"] = "config"
     name: str = ""
     options: list[ASTNode] = field(
         default_factory=list
@@ -156,7 +156,7 @@ class MenuEntry(ASTNode):
 
     line_number: int = 0
     title: str = ""
-    depends: list[str] = field(default_factory=list)
+    options: list[ConfigOption] = field(default_factory=list)
     statements: list[ASTNode] = field(default_factory=list)
 
 
@@ -314,7 +314,7 @@ class KconfigParser:
             return node
 
         # Config/menuconfig
-        if stripped.startswith("config "):
+        if stripped.startswith(("config ", "configdefault ")):
             return self._parse_config_entry()
 
         if stripped.startswith("menuconfig "):
@@ -346,7 +346,7 @@ class KconfigParser:
         return node
 
     def _parse_config_entry(self) -> ConfigEntry:
-        """Parse a config or menuconfig entry."""
+        """Parse a config, configdefault or menuconfig entry."""
         line = self._current_line()
         stripped = line.lstrip()
 
@@ -356,6 +356,9 @@ class KconfigParser:
         if stripped_no_comment.startswith("menuconfig "):
             config_type = "menuconfig"
             name = stripped_no_comment[11:].strip()
+        elif stripped_no_comment.startswith("configdefault "):
+            config_type = "configdefault"
+            name = stripped_no_comment[14:].strip()
         else:
             config_type = "config"
             name = stripped_no_comment[7:].strip()
@@ -572,6 +575,7 @@ class KconfigParser:
         """Check if line starts with a structural keyword."""
         keywords = [
             "config ",
+            "configdefault ",
             "menuconfig ",
             "choice",
             "endchoice",
@@ -598,6 +602,9 @@ class KconfigParser:
             "hex",
             "def_bool",
             "def_tristate",
+            "def_int",
+            "def_hex",
+            "def_string",
             "prompt",
             "default",
             "depends on",
@@ -627,7 +634,11 @@ class KconfigParser:
             "hex": r"^hex(\s+(.*))?$",
             "def_bool": r"^def_bool\s+(.+)$",
             "def_tristate": r"^def_tristate\s+(.+)$",
+            "def_int": r"^def_int\s+(.+)$",
+            "def_hex": r"^def_hex\s+(.+)$",
+            "def_string": r"^def_string\s+(.+)$",
             "prompt": r"^prompt\s+(.+)$",
+            "visible_if": r"^visible\s+if\s+(.+)$",
             "default": r"^default\s+(.+)$",
             "depends_on": r"^depends\s+on\s+(.+)$",
             "select": r"^select\s+(.+)$",
@@ -860,16 +871,13 @@ class KconfigParser:
                 self._advance()
                 break
 
-            # Depends on for menu
-            if stripped.startswith("depends on "):
-                node.depends.append(stripped[11:].strip())
-                self._advance()
-                continue
-
-            # Otherwise parse as statement
-            stmt = self._parse_statement()
-            if stmt:
-                node.statements.append(stmt)
+            if stripped.startswith(("depends on ", "visible if ")):
+                node.options.append(self._parse_config_option())
+            else:
+                # Otherwise parse as statement
+                stmt = self._parse_statement()
+                if stmt:
+                    node.statements.append(stmt)
 
         return node
 
@@ -1133,7 +1141,7 @@ class KconfigFormatter:
             self.lines.append(f"{indent}#")
 
     def _format_config_entry(self, node: ConfigEntry, indent_level: int):
-        """Format a config or menuconfig entry."""
+        """Format a config, configdefault or menuconfig entry."""
         indent = self._get_indent(indent_level)
         line = f"{indent}{node.config_type} {node.name}"
         line = self._append_inline_comment(line, node.inline_comment)
@@ -1166,14 +1174,12 @@ class KconfigFormatter:
         indent = self._get_indent(indent_level, 1)
 
         # Build the line
-        if node.option_type == "depends_on":
-            line = f"{indent}depends on {node.value}"
-        elif node.option_type in ["bool", "tristate", "string", "int", "hex"]:
+        if node.option_type in ["bool", "tristate", "string", "int", "hex"]:
             if node.value:
                 line = f"{indent}{node.option_type} {node.value}"
             else:
                 line = f"{indent}{node.option_type}"
-        elif node.option_type in ["def_bool", "def_tristate"]:
+        elif node.option_type.startswith("def_"):
             line = f"{indent}{node.option_type} {node.value}"
         else:
             line = f"{indent}{node.option_type.replace('_', ' ')} {node.value}"
@@ -1349,9 +1355,8 @@ class KconfigFormatter:
         self.lines.append(f'{indent}menu "{node.title}"')
 
         # Depends
-        option_indent = self._get_indent(indent_level, 1)
-        for dep in node.depends:
-            self.lines.append(f"{option_indent}depends on {dep}")
+        for option in node.options:
+            self._format_config_option(option, indent_level)
 
         # Statements
         next_level = indent_level + (1 if self.config.indent_sub_items else 0)
@@ -1518,23 +1523,21 @@ class KconfigLinter:
             elif in_help_block:
                 # Check if we're still in help text
                 # Help text can have tab + spaces (that's the expected format)
-                if stripped.startswith(
-                    (
-                        "#",
-                        "config",
-                        "menuconfig",
-                        "choice",
-                        "menu",
-                        "if ",
-                        "endif",
-                        "endmenu",
-                        "endchoice",
-                        "source",
-                        "rsource",
-                        "comment ",
-                        "mainmenu",
-                    )
-                ):
+                if stripped.startswith((
+                    "#",
+                    "config",
+                    "menuconfig",
+                    "choice",
+                    "menu",
+                    "if ",
+                    "endif",
+                    "endmenu",
+                    "endchoice",
+                    "source",
+                    "rsource",
+                    "comment ",
+                    "mainmenu",
+                )):
                     # We've hit a keyword, exit help block
                     in_help_block = False
                 else:
@@ -1679,6 +1682,8 @@ class KconfigLinter:
             return "comment_line"
         elif stripped.startswith("config "):
             return "config"
+        elif stripped.startswith("configdefault "):
+            return "configdefault"
         elif stripped.startswith("menuconfig "):
             return "menuconfig"
         elif stripped.startswith("menu "):
@@ -1700,7 +1705,7 @@ class KconfigLinter:
         elif stripped.startswith("help"):
             return "help"
         elif re.match(
-            r"^\s*(bool|tristate|string|int|hex|def_bool|def_tristate|prompt|default|depends on|select|imply|range|option)\s",
+            r"^\s*(bool|tristate|string|int|hex|def_bool|def_tristate|def_int|def_hex|def_string|prompt|default|depends on|visible if|select|imply|range|option)\s",
             stripped,
         ):
             return "option"
@@ -1708,8 +1713,8 @@ class KconfigLinter:
             return "other"
 
     def _check_config_name(self, line: str, line_num: int):
-        """Check config/menuconfig name formatting (for test compatibility)."""
-        match = re.match(r"^\s*(config|menuconfig)\s+(\S+)", line)
+        """Check config/configdefault/menuconfig name formatting (for test compatibility)."""
+        match = re.match(r"^\s*(config|configdefault|menuconfig)\s+(\S+)", line)
         if not match:
             return
 
@@ -1802,8 +1807,8 @@ def _dump_ast(nodes: list[ASTNode], indent: int = 0):
                 _dump_ast(node.entries, indent + 2)
         elif isinstance(node, MenuEntry):
             print(f"{prefix}MenuEntry: {node.title!r}")
-            if node.depends:
-                print(f"{prefix}  depends: {node.depends}")
+            for n in node.options:
+                print(f"{prefix}  {n.option_type.replace('_', ' ')}: {n.value}")
             if node.statements:
                 print(f"{prefix}  statements:")
                 _dump_ast(node.statements, indent + 2)

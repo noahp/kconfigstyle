@@ -163,6 +163,33 @@ class TestZephyrStyle:
         finally:
             temp_path.unlink()
 
+    def test_configdefault_no_issues(self):
+        """Test that Zephyr's configdefault entries lint clean."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "# Network configuration\n",
+            "\n",
+            "configdefault NETWORKING\n",
+            "\tdefault y\n",
+            "\n",
+            "configdefault NET_IPV4\n",
+            "\tdefault n if NET_IPV6\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            issues = linter.lint_file(temp_path)
+            assert len(issues) == 0, f"Expected no issues, got: {issues}"
+        finally:
+            temp_path.unlink()
+
 
 class TestESPIDFStyle:
     """Test ESP-IDF style linting."""
@@ -452,6 +479,13 @@ class TestLineTypeDetection:
 
         assert linter._get_line_type("\tdepends on FOO") == "option"
 
+    def test_visible_if(self):
+        """Test detection of visible if."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        assert linter._get_line_type("\tvisible if FOO") == "option"
+
     def test_detect_comment(self):
         """Test detection of comments."""
         config = LinterConfig.zephyr_preset()
@@ -659,6 +693,9 @@ class TestEdgeCases:
         assert linter._get_line_type('\thex "Value"') == "option"
         assert linter._get_line_type("\tdef_bool y") == "option"
         assert linter._get_line_type("\tdef_tristate y") == "option"
+        assert linter._get_line_type("\tdef_int 3") == "option"
+        assert linter._get_line_type("\tdef_hex 0x10") == "option"
+        assert linter._get_line_type('\tdef_string "x"') == "option"
         assert linter._get_line_type('\tprompt "Text"') == "option"
         assert linter._get_line_type("\tdefault y") == "option"
         assert linter._get_line_type("\tselect FOO") == "option"
@@ -3057,6 +3094,36 @@ class TestCoverageImprovements:
         finally:
             temp_path.unlink()
 
+    def test_menu_with_visible_if(self):
+        """Test menu with visible if and depends on, keeping inline comments."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            'menu "Advanced"\n',
+            "\tdepends on DEBUG # needs debug\n",
+            "\tvisible if EXPERT # hide\n",
+            "\tconfig ADV_OPT\n",
+            '\t\tbool "Advanced option"\n',
+            "endmenu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert formatted[:3] == [
+                'menu "Advanced"\n',
+                "\tdepends on DEBUG  # needs debug\n",
+                "\tvisible if EXPERT  # hide\n",
+            ]
+        finally:
+            temp_path.unlink()
+
     def test_line_wrapping_with_or_operator(self):
         """Test line wrapping with || operator."""
         config = LinterConfig.zephyr_preset()
@@ -3156,6 +3223,41 @@ class TestCoverageImprovements:
             formatted, _ = linter.format_file(temp_path)
             assert any("def_bool" in line for line in formatted)
             assert any("def_tristate" in line for line in formatted)
+        finally:
+            temp_path.unlink()
+
+    def test_def_int_hex_string(self):
+        """Test def_int, def_hex and def_string are parsed as options, not unknown lines."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            "config TEST1\n",
+            "\tdef_int 3 if FOO # three\n",
+            "config TEST2\n",
+            "\tdef_hex 0x10\n",
+            "config TEST3\n",
+            '\tdef_string "x"\n',
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            assert formatted == [
+                "config TEST1\n",
+                "\tdef_int 3 if FOO  # three\n",
+                "\n",
+                "config TEST2\n",
+                "\tdef_hex 0x10\n",
+                "\n",
+                "config TEST3\n",
+                '\tdef_string "x"\n',
+            ]
         finally:
             temp_path.unlink()
 
