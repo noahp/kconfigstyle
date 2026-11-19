@@ -235,9 +235,19 @@ def _split_condition(value: str) -> tuple[str, str]:
 
 
 def _unquote(s: str) -> str:
-    if len(s) >= 2 and s[0] == s[-1] == '"':
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         return s[1:-1]
     return s
+
+
+def _quote(s: str) -> str:
+    """Double-quote s, unless it holds an unescaped '"' (from a '...' string)."""
+    escaped = False
+    for c in s:
+        if c == '"' and not escaped:
+            return f"'{s}'"
+        escaped = c == "\\" and not escaped
+    return f'"{s}"'
 
 
 def _indent_of(line: str) -> int:
@@ -251,6 +261,11 @@ def _column_of(line: str) -> int:
 
 def _is_structural(stripped: str) -> bool:
     return _STRUCTURAL_RE.match(stripped) is not None
+
+
+def _starts_statement(stripped: str) -> bool:
+    """Whether a line ends the current entry, whatever its indentation."""
+    return _is_structural(stripped) or bool(_MACRO_ASSIGN_RE.match(stripped.rstrip()))
 
 
 def _is_option(stripped: str) -> bool:
@@ -391,7 +406,7 @@ class KconfigParser:
                 self._advance()
                 continue
 
-            if _is_structural(stripped):
+            if _starts_statement(stripped):
                 break
 
             # Unindented lines continue the config only if they look like options
@@ -411,7 +426,7 @@ class KconfigParser:
             peek_stripped = peek.lstrip()
             if not peek_stripped:
                 continue
-            if _is_structural(peek_stripped) or peek[0] not in " \t":
+            if _starts_statement(peek_stripped) or peek[0] not in " \t":
                 return False
             return not (seen_content and _indent_of(peek) <= config_indent)
         return False
@@ -537,7 +552,7 @@ class KconfigParser:
                 self._advance()
             elif stripped.startswith("#"):
                 pending.append(self._comment_node(stripped))
-            elif _is_structural(stripped):
+            elif _starts_statement(stripped):
                 flush(node.entries)
                 node.entries.append(self._parse_statement())
             else:
@@ -733,15 +748,19 @@ class KconfigFormatter:
         elif isinstance(node, SourceStatement):
             indent = self._get_indent(level)
             self._emit(
-                f'{indent}{node.source_type} "{node.path}"', node.inline_comment, indent
+                f"{indent}{node.source_type} {_quote(node.path)}",
+                node.inline_comment,
+                indent,
             )
         elif isinstance(node, CommentStatement):
             indent = self._get_indent(level)
-            self._emit(f'{indent}comment "{node.text}"', node.inline_comment, indent)
+            self._emit(
+                f"{indent}comment {_quote(node.text)}", node.inline_comment, indent
+            )
             for dep in node.depends:
                 self.lines.append(f"{self._get_indent(level, 1)}depends on {dep}")
         elif isinstance(node, MainMenu):
-            self._emit(f'mainmenu "{node.title}"', node.inline_comment, "")
+            self._emit(f"mainmenu {_quote(node.title)}", node.inline_comment, "")
         elif isinstance(node, MacroAssignment):
             line = f"{self._get_indent(level)}{node.name} {node.op}"
             self.lines.append(f"{line} {node.value}" if node.value else line)
@@ -867,7 +886,7 @@ class KconfigFormatter:
 
     def _format_menu(self, node: MenuEntry, level: int):
         indent = self._get_indent(level)
-        self._emit(f'{indent}menu "{node.title}"', node.inline_comment, indent)
+        self._emit(f"{indent}menu {_quote(node.title)}", node.inline_comment, indent)
         for option in node.options:
             self._format_config_option(option, level)
         self._format_statements(node.statements, self._sub_level(level))

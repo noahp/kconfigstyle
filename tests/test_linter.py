@@ -3843,6 +3843,22 @@ class TestRegressions:
         out = _fmt(src, LinterConfig.espidf_preset())
         assert out == "if X\n    foo = 1\n\nendif\n"
 
+    def test_single_quoted_strings_not_double_wrapped(self):
+        src = "mainmenu 'T'\ngsource 'a/*/K'\nsource 'b'\nmenu 'M'\nendmenu\ncomment 'C'\n"
+        out = _fmt(src)
+        assert "'" not in out
+        assert 'gsource "a/*/K"' in out and 'menu "M"' in out
+
+    def test_single_quoted_string_with_double_quote_kept(self):
+        src = """comment 'say "hi"'\n"""
+        assert _fmt(src) == src
+
+    def test_macro_assignment_ends_config_entry(self):
+        config = LinterConfig.espidf_preset()
+        once = _fmt("if X\nconfig A\n\tbool\nfoo = 1\nendif\n", config)
+        assert "\n    foo = 1\n" in once
+        assert _fmt(once, config) == once
+
     def test_wrap_ignores_operators_inside_strings(self):
         config = LinterConfig.zephyr_preset()
         config.max_line_length = 40
