@@ -3611,3 +3611,78 @@ class TestCoverageImprovements:
             assert "\n\n\n" not in formatted_text
         finally:
             temp_path.unlink()
+
+    def test_choice_with_source_statements(self):
+        """source/rsource inside a choice must be preserved (issue #3)."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        lines = [
+            'menu "Crypto Accelerators"\n',
+            "\n",
+            "choice PSA_CRYPTO_ECC_P256_ACCELERATOR\n",
+            '\tprompt "P-256 ECC acceleration backend"\n',
+            "\tdefault PSA_CRYPTO_ACCELERATOR_NONE\n",
+            "\n",
+            "config PSA_CRYPTO_ACCELERATOR_NONE\n",
+            '\tbool "No accelerator (builtin software)"\n',
+            "\n",
+            'rsource "stm32_pka/Kconfig"\n',
+            'source "other/Kconfig"\n',
+            "config PSA_CRYPTO_ACCELERATOR_P256M\n",
+            '\tbool "p256-m optimized software driver"\n',
+            "\n",
+            "endchoice\n",
+            "\n",
+            "endmenu\n",
+        ]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".Kconfig", delete=False
+        ) as f:
+            f.writelines(lines)
+            temp_path = Path(f.name)
+
+        try:
+            formatted, _ = linter.format_file(temp_path)
+            formatted_text = "".join(formatted)
+
+            assert 'rsource "stm32_pka/Kconfig"' in formatted_text
+            assert 'source "other/Kconfig"' in formatted_text
+            assert "config PSA_CRYPTO_ACCELERATOR_P256M" in formatted_text
+        finally:
+            temp_path.unlink()
+
+    def test_unknown_option_does_not_drop_next_line(self):
+        """An unrecognized option line must not swallow the following line."""
+        config = LinterConfig.zephyr_preset()
+        linter = KconfigLinter(config)
+
+        for lines in (
+            ["config FOO\n", '\tbool "foo"\n', "\tweirdopt x\n", "\tdefault y\n"],
+            [
+                "choice\n",
+                '\tprompt "p"\n',
+                "\tweirdopt x\n",
+                "\tdefault A\n",
+                "\n",
+                "config A\n",
+                '\tbool "a"\n',
+                "\n",
+                "endchoice\n",
+            ],
+        ):
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".Kconfig", delete=False
+            ) as f:
+                f.writelines(lines)
+                temp_path = Path(f.name)
+
+            try:
+                formatted, _ = linter.format_file(temp_path)
+                formatted_text = "".join(formatted)
+
+                assert "weirdopt x" in formatted_text
+                assert "default" in formatted_text
+            finally:
+                temp_path.unlink()

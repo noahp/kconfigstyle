@@ -675,8 +675,7 @@ class KconfigParser:
                 self._advance()
                 return node
 
-        # Unknown option type - skip
-        self._advance()
+        # Unknown option type; caller decides how to consume the line
         return None
 
     def _parse_help_block(self) -> HelpText:
@@ -823,6 +822,10 @@ class KconfigParser:
                 node.entries.append(self._parse_if_block())
                 continue
 
+            if stripped.startswith(("source ", "rsource ", "osource ", "orsource ")):
+                node.entries.append(self._parse_source())
+                continue
+
             # Comment
             if stripped.startswith("#"):
                 text = stripped[1:].strip() if len(stripped) > 1 else ""
@@ -842,6 +845,9 @@ class KconfigParser:
             if option:
                 node.options.append(option)
             else:
+                node.options.append(
+                    UnknownLine(text=line, line_number=self.current_line_num)
+                )
                 self._advance()
 
         return node
