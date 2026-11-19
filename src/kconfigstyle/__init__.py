@@ -235,9 +235,19 @@ def _split_condition(value: str) -> tuple[str, str]:
 
 
 def _unquote(s: str) -> str:
-    if len(s) >= 2 and s[0] == s[-1] == '"':
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         return s[1:-1]
     return s
+
+
+def _quote(s: str) -> str:
+    """Double-quote s, unless it holds an unescaped '"' (from a '...' string)."""
+    escaped = False
+    for c in s:
+        if c == '"' and not escaped:
+            return f"'{s}'"
+        escaped = c == "\\" and not escaped
+    return f'"{s}"'
 
 
 def _indent_of(line: str) -> int:
@@ -251,6 +261,10 @@ def _column_of(line: str) -> int:
 
 def _is_structural(stripped: str) -> bool:
     return _STRUCTURAL_RE.match(stripped) is not None
+
+
+def _is_macro_assignment(stripped: str) -> bool:
+    return _MACRO_ASSIGN_RE.match(stripped.rstrip()) is not None
 
 
 def _is_option(stripped: str) -> bool:
@@ -344,18 +358,21 @@ class KconfigParser:
         if parser:
             return parser()
 
-        m = _MACRO_ASSIGN_RE.match(stripped.rstrip())
-        if m:
-            node = MacroAssignment(
-                name=m.group(1),
-                op=m.group(2),
-                value=m.group(3),
-                line_number=self._line_number,
-            )
-            self._advance()
-            return node
+        if _is_macro_assignment(stripped):
+            return self._parse_macro_assignment()
 
         node = UnknownLine(text=line, line_number=self._line_number)
+        self._advance()
+        return node
+
+    def _parse_macro_assignment(self) -> MacroAssignment:
+        m = _MACRO_ASSIGN_RE.match(self._current_line().strip())
+        node = MacroAssignment(
+            name=m.group(1),
+            op=m.group(2),
+            value=m.group(3),
+            line_number=self._line_number,
+        )
         self._advance()
         return node
 
@@ -393,6 +410,11 @@ class KconfigParser:
 
             if _is_structural(stripped):
                 break
+            # Kconfiglib allows assignments between properties, so only one
+            # at the entry's own indent (where the formatter puts
+            # statement-level ones) ends it
+            if _is_macro_assignment(stripped) and _indent_of(line) <= config_indent:
+                break
 
             # Unindented lines continue the config only if they look like options
             if line[0] not in " \t" and not (
@@ -427,6 +449,8 @@ class KconfigParser:
         option = self._parse_config_option()
         if option:
             return option
+        if _is_macro_assignment(stripped):
+            return self._parse_macro_assignment()
         node = UnknownLine(text=line, line_number=self._line_number)
         self._advance()
         return node
@@ -537,7 +561,9 @@ class KconfigParser:
                 self._advance()
             elif stripped.startswith("#"):
                 pending.append(self._comment_node(stripped))
-            elif _is_structural(stripped):
+            elif _is_structural(stripped) or (
+                node.entries and _is_macro_assignment(stripped)
+            ):
                 flush(node.entries)
                 node.entries.append(self._parse_statement())
             else:
@@ -733,17 +759,22 @@ class KconfigFormatter:
         elif isinstance(node, SourceStatement):
             indent = self._get_indent(level)
             self._emit(
-                f'{indent}{node.source_type} "{node.path}"', node.inline_comment, indent
+                f"{indent}{node.source_type} {_quote(node.path)}",
+                node.inline_comment,
+                indent,
             )
         elif isinstance(node, CommentStatement):
             indent = self._get_indent(level)
-            self._emit(f'{indent}comment "{node.text}"', node.inline_comment, indent)
+            self._emit(
+                f"{indent}comment {_quote(node.text)}", node.inline_comment, indent
+            )
             for dep in node.depends:
                 self.lines.append(f"{self._get_indent(level, 1)}depends on {dep}")
         elif isinstance(node, MainMenu):
-            self._emit(f'mainmenu "{node.title}"', node.inline_comment, "")
+            self._emit(f"mainmenu {_quote(node.title)}", node.inline_comment, "")
         elif isinstance(node, MacroAssignment):
-            line = f"{self._get_indent(level)}{node.name} {node.op}"
+            indent = self._get_indent(level, 1 if in_config else 0)
+            line = f"{indent}{node.name} {node.op}"
             self.lines.append(f"{line} {node.value}" if node.value else line)
 
     def _format_statements(self, statements: list[ASTNode], level: int):
@@ -867,7 +898,7 @@ class KconfigFormatter:
 
     def _format_menu(self, node: MenuEntry, level: int):
         indent = self._get_indent(level)
-        self._emit(f'{indent}menu "{node.title}"', node.inline_comment, indent)
+        self._emit(f"{indent}menu {_quote(node.title)}", node.inline_comment, indent)
         for option in node.options:
             self._format_config_option(option, level)
         self._format_statements(node.statements, self._sub_level(level))
