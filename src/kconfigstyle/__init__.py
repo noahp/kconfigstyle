@@ -1523,21 +1523,23 @@ class KconfigLinter:
             elif in_help_block:
                 # Check if we're still in help text
                 # Help text can have tab + spaces (that's the expected format)
-                if stripped.startswith((
-                    "#",
-                    "config",
-                    "menuconfig",
-                    "choice",
-                    "menu",
-                    "if ",
-                    "endif",
-                    "endmenu",
-                    "endchoice",
-                    "source",
-                    "rsource",
-                    "comment ",
-                    "mainmenu",
-                )):
+                if stripped.startswith(
+                    (
+                        "#",
+                        "config",
+                        "menuconfig",
+                        "choice",
+                        "menu",
+                        "if ",
+                        "endif",
+                        "endmenu",
+                        "endchoice",
+                        "source",
+                        "rsource",
+                        "comment ",
+                        "mainmenu",
+                    )
+                ):
                     # We've hit a keyword, exit help block
                     in_help_block = False
                 else:
