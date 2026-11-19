@@ -3,6 +3,7 @@
 Kconfiglib itself is the oracle: formatting must not change what it parses.
 """
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -54,9 +55,6 @@ CORPUS_ENV = {
     "FOO": "bar baz",
 }
 
-# '-help---' isn't recognized, so the help body is reindented as options
-UNSUPPORTED_SYNTAX = {"tests/Khelp"}
-
 
 def _format(text: str, config: LinterConfig) -> str:
     ast = KconfigParser().parse(text)
@@ -67,10 +65,17 @@ def _fingerprint(filename: str) -> list[str]:
     """Kconfiglib's normalized view of every menu node in the tree."""
     kconf = kconfiglib.Kconfig(filename, warn=False)
     for node in kconf.node_iter():
-        # The formatter drops empty help blocks
-        if getattr(node, "help", None) == "":
+        # By design, the formatter drops empty help and collapses blank lines
+        help_text = getattr(node, "help", None)
+        if help_text == "":
             node.help = None
-    return [kconf.mainmenu_text] + [str(node) for node in kconf.node_iter()]
+        elif help_text:
+            node.help = re.sub(r"\n{3,}", "\n\n", help_text)
+    variables = [
+        f"{name} {'=' if var.is_recursive else ':='} {var.value}"
+        for name, var in sorted(kconf.variables.items())
+    ]
+    return [kconf.mainmenu_text, *variables] + [str(n) for n in kconf.node_iter()]
 
 
 @pytest.fixture(scope="module", params=PRESETS)
@@ -102,12 +107,8 @@ def test_format_is_idempotent(filename, preset):
 
 
 @pytest.mark.parametrize("filename", CORPUS)
-def test_format_preserves_semantics(
-    filename, formatted_tree, corpus_env, monkeypatch, request
-):
+def test_format_preserves_semantics(filename, formatted_tree, corpus_env, monkeypatch):
     _, root = formatted_tree
-    if filename in UNSUPPORTED_SYNTAX:
-        request.applymarker(pytest.mark.xfail(reason="unsupported syntax", strict=True))
 
     def load(srctree: Path) -> list[str]:
         monkeypatch.setenv("srctree", str(srctree))

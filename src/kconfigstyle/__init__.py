@@ -133,7 +133,8 @@ class IfBlock(ASTNode):
 
 @dataclass
 class SourceStatement(ASTNode):
-    source_type: str = "source"  # 'source', 'rsource', 'osource', 'orsource'
+    # 'source', 'rsource', 'osource', 'orsource', 'gsource', 'grsource'
+    source_type: str = "source"
     path: str = ""
 
 
@@ -146,6 +147,20 @@ class CommentStatement(ASTNode):
 
 
 @dataclass
+class MainMenu(ASTNode):
+    title: str = ""
+
+
+@dataclass
+class MacroAssignment(ASTNode):
+    """A preprocessor variable assignment, e.g. 'cc-option := $(shell,...)'."""
+
+    name: str = ""
+    op: str = "="  # '=', ':=' or '+='
+    value: str = ""  # Verbatim: whitespace inside macro calls is significant
+
+
+@dataclass
 class UnknownLine(ASTNode):
     """An unrecognized line, preserved as-is."""
 
@@ -154,20 +169,27 @@ class UnknownLine(ASTNode):
 
 BLOCK_TYPES = (ConfigEntry, ChoiceEntry, MenuEntry, IfBlock, CommentStatement)
 
-TYPE_KEYWORDS = ("bool", "tristate", "string", "int", "hex")
+TYPE_KEYWORDS = ("bool", "boolean", "tristate", "string", "int", "hex")
+# Options that are complete without a value
+BARE_OPTIONS = TYPE_KEYWORDS + ("optional", "modules")
 
 _STRUCTURAL_RE = re.compile(
     r"^(config|configdefault|menuconfig|choice|endchoice|menu|endmenu|if|endif"
-    r"|source|rsource|osource|orsource|comment|mainmenu)"
+    r"|source|rsource|osource|orsource|gsource|grsource|comment|mainmenu)"
     # Not a prefix of a longer word (if-success) or a macro assignment (if := x)
     r"(?![\w-])(?!\s*[:+]?=)"
 )
 _OPTION_RE = re.compile(
-    r"^(bool|tristate|string|int|hex|def_bool|def_tristate|def_int|def_hex"
-    r"|def_string|prompt|default|select|imply|range|option|depends\s+on"
-    r"|visible\s+if)(?:\s+(.*))?$"
+    r"^(bool|boolean|tristate|string|int|hex|def_bool|def_tristate|def_int"
+    r"|def_hex|def_string|prompt|default|select|imply|range|option|optional"
+    r"|modules|depends\s+on|visible\s+if)(?:\s+(.*))?$"
 )
-_HELP_RE = re.compile(r"^(?:help|---help---)(?:\s|$)")
+# Kconfiglib accepts any dashes around 'help' ('---help---', '-help---')
+_HELP_RE = re.compile(r"^-*help-*(?:\s|$)")
+# The name may contain macro calls, nested one level: '$(prefix)-flags := ...'
+_MACRO_ASSIGN_RE = re.compile(
+    r"^((?:[A-Za-z0-9_-]|\$\((?:[^()]|\([^()]*\))*\))+)\s*(:=|\+=|=)\s*(.*)$"
+)
 
 
 def _mask_quotes(s: str) -> str:
@@ -314,10 +336,24 @@ class KconfigParser:
             "rsource": self._parse_source,
             "osource": self._parse_source,
             "orsource": self._parse_source,
+            "gsource": self._parse_source,
+            "grsource": self._parse_source,
             "comment": self._parse_comment_statement,
+            "mainmenu": self._parse_mainmenu,
         }.get(m.group(1))
         if parser:
             return parser()
+
+        m = _MACRO_ASSIGN_RE.match(stripped.rstrip())
+        if m:
+            node = MacroAssignment(
+                name=m.group(1),
+                op=m.group(2),
+                value=m.group(3),
+                line_number=self._line_number,
+            )
+            self._advance()
+            return node
 
         node = UnknownLine(text=line, line_number=self._line_number)
         self._advance()
@@ -403,7 +439,7 @@ class KconfigParser:
             return None
         option_type = re.sub(r"\s+", "_", m.group(1))
         raw_value = m.group(2) or ""
-        if not raw_value and option_type not in TYPE_KEYWORDS:
+        if not raw_value and option_type not in BARE_OPTIONS:
             return None
 
         value, condition = _split_condition(raw_value)
@@ -570,6 +606,16 @@ class KconfigParser:
         self._advance()
         return node
 
+    def _parse_mainmenu(self) -> MainMenu:
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        node = MainMenu(
+            title=_unquote(_keyword_rest(code, "mainmenu")),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
+        self._advance()
+        return node
+
     def _parse_comment_statement(self) -> CommentStatement:
         code, inline_comment = _split_comment(self._current_line().lstrip())
         node = CommentStatement(
@@ -694,6 +740,11 @@ class KconfigFormatter:
             self._emit(f'{indent}comment "{node.text}"', node.inline_comment, indent)
             for dep in node.depends:
                 self.lines.append(f"{self._get_indent(level, 1)}depends on {dep}")
+        elif isinstance(node, MainMenu):
+            self._emit(f'mainmenu "{node.title}"', node.inline_comment, "")
+        elif isinstance(node, MacroAssignment):
+            line = f"{self._get_indent(level)}{node.name} {node.op}"
+            self.lines.append(f"{line} {node.value}" if node.value else line)
 
     def _format_statements(self, statements: list[ASTNode], level: int):
         prev_was_empty = False
