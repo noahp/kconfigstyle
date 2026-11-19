@@ -3859,6 +3859,16 @@ class TestRegressions:
         assert "\n    foo = 1\n" in once
         assert _fmt(once, config) == once
 
+    def test_macro_assignment_between_config_properties(self):
+        src = "config A\n\tbool\n\tfoo = 1\n\thelp\n\t  Text\n\t  config EXAMPLE\n"
+        assert _fmt(src) == src
+        entry = KconfigParser().parse(src)[0]
+        assert isinstance(entry.options[1], MacroAssignment)
+
+    def test_macro_assignment_in_choice_header_keeps_order(self):
+        src = 'choice\n\tlabel = Pick one\n\tprompt "$(label)"\n\nconfig X\n\tbool "x"\n\nendchoice\n'
+        assert _fmt(src) == src
+
     def test_wrap_ignores_operators_inside_strings(self):
         config = LinterConfig.zephyr_preset()
         config.max_line_length = 40

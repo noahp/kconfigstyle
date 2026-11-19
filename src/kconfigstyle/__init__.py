@@ -263,9 +263,8 @@ def _is_structural(stripped: str) -> bool:
     return _STRUCTURAL_RE.match(stripped) is not None
 
 
-def _starts_statement(stripped: str) -> bool:
-    """Whether a line ends the current entry, whatever its indentation."""
-    return _is_structural(stripped) or bool(_MACRO_ASSIGN_RE.match(stripped.rstrip()))
+def _is_macro_assignment(stripped: str) -> bool:
+    return _MACRO_ASSIGN_RE.match(stripped.rstrip()) is not None
 
 
 def _is_option(stripped: str) -> bool:
@@ -359,18 +358,21 @@ class KconfigParser:
         if parser:
             return parser()
 
-        m = _MACRO_ASSIGN_RE.match(stripped.rstrip())
-        if m:
-            node = MacroAssignment(
-                name=m.group(1),
-                op=m.group(2),
-                value=m.group(3),
-                line_number=self._line_number,
-            )
-            self._advance()
-            return node
+        if _is_macro_assignment(stripped):
+            return self._parse_macro_assignment()
 
         node = UnknownLine(text=line, line_number=self._line_number)
+        self._advance()
+        return node
+
+    def _parse_macro_assignment(self) -> MacroAssignment:
+        m = _MACRO_ASSIGN_RE.match(self._current_line().strip())
+        node = MacroAssignment(
+            name=m.group(1),
+            op=m.group(2),
+            value=m.group(3),
+            line_number=self._line_number,
+        )
         self._advance()
         return node
 
@@ -406,7 +408,12 @@ class KconfigParser:
                 self._advance()
                 continue
 
-            if _starts_statement(stripped):
+            if _is_structural(stripped):
+                break
+            # Kconfiglib allows assignments between properties, so only one
+            # at the entry's own indent (where the formatter puts
+            # statement-level ones) ends it
+            if _is_macro_assignment(stripped) and _indent_of(line) <= config_indent:
                 break
 
             # Unindented lines continue the config only if they look like options
@@ -426,7 +433,7 @@ class KconfigParser:
             peek_stripped = peek.lstrip()
             if not peek_stripped:
                 continue
-            if _starts_statement(peek_stripped) or peek[0] not in " \t":
+            if _is_structural(peek_stripped) or peek[0] not in " \t":
                 return False
             return not (seen_content and _indent_of(peek) <= config_indent)
         return False
@@ -442,6 +449,8 @@ class KconfigParser:
         option = self._parse_config_option()
         if option:
             return option
+        if _is_macro_assignment(stripped):
+            return self._parse_macro_assignment()
         node = UnknownLine(text=line, line_number=self._line_number)
         self._advance()
         return node
@@ -552,7 +561,9 @@ class KconfigParser:
                 self._advance()
             elif stripped.startswith("#"):
                 pending.append(self._comment_node(stripped))
-            elif _starts_statement(stripped):
+            elif _is_structural(stripped) or (
+                node.entries and _is_macro_assignment(stripped)
+            ):
                 flush(node.entries)
                 node.entries.append(self._parse_statement())
             else:
@@ -762,7 +773,8 @@ class KconfigFormatter:
         elif isinstance(node, MainMenu):
             self._emit(f"mainmenu {_quote(node.title)}", node.inline_comment, "")
         elif isinstance(node, MacroAssignment):
-            line = f"{self._get_indent(level)}{node.name} {node.op}"
+            indent = self._get_indent(level, 1 if in_config else 0)
+            line = f"{indent}{node.name} {node.op}"
             self.lines.append(f"{line} {node.value}" if node.value else line)
 
     def _format_statements(self, statements: list[ASTNode], level: int):
