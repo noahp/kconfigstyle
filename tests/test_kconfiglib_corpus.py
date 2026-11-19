@@ -54,10 +54,8 @@ CORPUS_ENV = {
     "FOO": "bar baz",
 }
 
-# Help text lines indented deeper than the first are flattened
-HELP_RELATIVE_INDENT = {"tests/Khelp", "tests/Klocation", "tests/Kstr"}
-# An empty 'help' followed by an indented entry: the entry becomes help text
-EMPTY_HELP_SWALLOWS_ENTRY = {("tests/Klocation", "espidf")}
+# '-help---' isn't recognized, so the help body is reindented as options
+UNSUPPORTED_SYNTAX = {"tests/Khelp"}
 
 
 def _format(text: str, config: LinterConfig) -> str:
@@ -68,6 +66,10 @@ def _format(text: str, config: LinterConfig) -> str:
 def _fingerprint(filename: str) -> list[str]:
     """Kconfiglib's normalized view of every menu node in the tree."""
     kconf = kconfiglib.Kconfig(filename, warn=False)
+    for node in kconf.node_iter():
+        # The formatter drops empty help blocks
+        if getattr(node, "help", None) == "":
+            node.help = None
     return [kconf.mainmenu_text] + [str(node) for node in kconf.node_iter()]
 
 
@@ -93,11 +95,7 @@ def corpus_env(monkeypatch):
 
 @pytest.mark.parametrize("preset", PRESETS)
 @pytest.mark.parametrize("filename", CORPUS)
-def test_format_is_idempotent(filename, preset, request):
-    if (filename, preset) in EMPTY_HELP_SWALLOWS_ENTRY:
-        request.applymarker(
-            pytest.mark.xfail(reason="empty help swallows next entry", strict=True)
-        )
+def test_format_is_idempotent(filename, preset):
     config = PRESETS[preset]()
     once = _format((KCONFIGLIB_ROOT / filename).read_text(), config)
     assert _format(once, config) == once
@@ -108,10 +106,8 @@ def test_format_preserves_semantics(
     filename, formatted_tree, corpus_env, monkeypatch, request
 ):
     _, root = formatted_tree
-    if filename in HELP_RELATIVE_INDENT:
-        request.applymarker(
-            pytest.mark.xfail(reason="help text relative indent lost", strict=True)
-        )
+    if filename in UNSUPPORTED_SYNTAX:
+        request.applymarker(pytest.mark.xfail(reason="unsupported syntax", strict=True))
 
     def load(srctree: Path) -> list[str]:
         monkeypatch.setenv("srctree", str(srctree))

@@ -222,6 +222,11 @@ def _indent_of(line: str) -> int:
     return len(line) - len(line.lstrip())
 
 
+def _column_of(line: str) -> int:
+    """Indent width with tabs expanded, as Kconfiglib measures help text."""
+    return _indent_of(line.expandtabs())
+
+
 def _is_structural(stripped: str) -> bool:
     return _STRUCTURAL_RE.match(stripped) is not None
 
@@ -432,13 +437,13 @@ class KconfigParser:
                     # Dedent past the help text ends the block. Leave the blank
                     # line so the parent can attribute any following comment to
                     # the next entry.
-                    if help_indent is not None and _indent_of(next_line) < help_indent:
+                    if help_indent is not None and _column_of(next_line) < help_indent:
                         break
                 node.lines.append("")
                 self.pos += 1
                 continue
 
-            indent = _indent_of(line)
+            indent = _column_of(line)
             if help_indent is None:
                 if indent == 0:
                     if _is_structural(stripped):
@@ -453,7 +458,8 @@ class KconfigParser:
             # Anything at or past the help indent is help text, even keywords
             if indent < help_indent:
                 break
-            node.lines.append(stripped)
+            # Keep indentation relative to the first line (nested lists, code)
+            node.lines.append(line.expandtabs()[help_indent:].rstrip())
             self.help_lines.add(self._line_number)
             self.pos += 1
 
@@ -744,6 +750,10 @@ class KconfigFormatter:
         self._emit(line, node.inline_comment, indent)
 
     def _format_help_text(self, node: HelpText, level: int):
+        # An empty help can't be represented when the next entry is indented
+        # (it would become the help text), and Kconfiglib warns about it anyway
+        if not node.lines:
+            return
         self.lines.append(f"{self._get_indent(level, 1)}help")
         help_indent = self._get_help_indent(level)
         if self.config.reflow_help_text:
@@ -759,17 +769,27 @@ class KconfigFormatter:
             available_width = 40
 
         result = []
-        # Parser guarantees no consecutive/trailing blanks, so blanks split paragraphs
-        for para in "\n".join(text_lines).split("\n\n"):
-            if result:
-                result.append("")
+        paragraph: list[str] = []
+
+        def flush():
             wrapped = textwrap.wrap(
-                " ".join(para.split("\n")),
+                " ".join(paragraph),
                 width=available_width,
                 break_long_words=False,
                 break_on_hyphens=False,
             )
             result.extend(f"{indent}{ln}" for ln in wrapped)
+            paragraph.clear()
+
+        for ln in text_lines:
+            if ln and not ln[0].isspace():
+                paragraph.append(ln)
+                continue
+            flush()
+            # Blank lines split paragraphs; deeper-indented lines (lists,
+            # code) are kept verbatim
+            result.append(f"{indent}{ln}" if ln else "")
+        flush()
         return result
 
     def _format_choice(self, node: ChoiceEntry, level: int):
