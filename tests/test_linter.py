@@ -15,6 +15,8 @@ from kconfigstyle import (
     KconfigLinter,
     KconfigParser,
     LinterConfig,
+    MacroAssignment,
+    MainMenu,
     MenuEntry,
     SourceStatement,
     UnknownLine,
@@ -470,8 +472,8 @@ class TestLineClassification:
     def test_keywords_need_word_boundary(self):
         assert isinstance(self.first("choices_are_fun"), UnknownLine)
         assert isinstance(self.first("menuish"), UnknownLine)
-        assert isinstance(self.first("if-success = $(shell,true)"), UnknownLine)
-        assert isinstance(self.first("source := foo"), UnknownLine)
+        assert isinstance(self.first("if-success = $(shell,true)"), MacroAssignment)
+        assert isinstance(self.first("source := foo"), MacroAssignment)
 
     def test_options(self):
         cases = {
@@ -3372,8 +3374,9 @@ class TestCoverageImprovements:
 
         try:
             formatted, _ = linter.format_file(temp_path)
-            # Should handle gracefully
-            assert any("help" in line for line in formatted)
+            # Empty help is dropped; the next config survives
+            assert not any("help" in line for line in formatted)
+            assert "config NEXT\n" in formatted
         finally:
             temp_path.unlink()
 
@@ -3772,6 +3775,73 @@ class TestRegressions:
     def test_empty_help_does_not_swallow_next_config(self):
         ast = KconfigParser().parse("config A\n\tbool\n\thelp\nconfig B\n\tbool\n")
         assert [n.name for n in ast if isinstance(n, ConfigEntry)] == ["A", "B"]
+
+    def test_empty_help_dropped_before_nested_entry(self):
+        # Hierarchical indent would put B where it reads as A's help text
+        src = "if X\nconfig A\n\tbool\n\thelp\nconfig B\n\tbool\nendif\n"
+        out = _fmt(src, LinterConfig.espidf_preset())
+        assert "help" not in out
+        assert [
+            n.name
+            for n in KconfigParser().parse(out)[0].statements
+            if isinstance(n, ConfigEntry)
+        ] == ["A", "B"]
+
+    def test_help_text_keeps_relative_indent(self):
+        src = (
+            "config A\n\tbool\n\thelp\n\t  List:\n\t    - one\n\t      more\n\t  end\n"
+        )
+        assert _fmt(src) == src
+
+    def test_help_relative_indent_counts_tabs_as_columns(self):
+        # Tab + 2 spaces is column 10, so 12 spaces is 2 deeper
+        src = "config A\n\tbool\n\thelp\n\t  a\n            b\n"
+        assert _fmt(src).endswith("\t  a\n\t    b\n")
+
+    def test_reflow_keeps_indented_help_lines(self):
+        config = LinterConfig.zephyr_preset()
+        config.reflow_help_text = True
+        src = "config A\n\tbool\n\thelp\n\t  Some\n\t  text:\n\t    code  here\n\t  after\n"
+        assert _fmt(src, config).endswith(
+            "\t  Some text:\n\t    code  here\n\t  after\n"
+        )
+
+    def test_mainmenu(self):
+        node = KconfigParser().parse('mainmenu "Zephyr"  # top\n')[0]
+        assert isinstance(node, MainMenu) and node.title == "Zephyr"
+        assert _fmt('mainmenu   "Zephyr"\n') == 'mainmenu "Zephyr"\n'
+
+    def test_gsource_grsource(self):
+        src = 'gsource "a/*/Kconfig"\ngrsource "b/*/Kconfig"\n'
+        ast = KconfigParser().parse(src)
+        assert [n.source_type for n in ast] == ["gsource", "grsource"]
+        assert _fmt(src) == src
+
+    def test_choice_optional(self):
+        src = 'choice\n\tprompt "P"\n\toptional\n\nconfig A\n\tbool "A"\n\nendchoice\n'
+        choice = KconfigParser().parse(src)[0]
+        assert [o.option_type for o in choice.options] == ["prompt", "optional"]
+        assert _fmt(src) == src
+
+    def test_odd_help_spelling_normalized(self):
+        src = "config A\n\tbool\n\t-help---\n\t  text\n"
+        assert _fmt(src) == "config A\n\tbool\n\thelp\n\t  text\n"
+
+    def test_macro_assignment(self):
+        node = KconfigParser().parse("$(pfx)-$($(x))-flags:=a  b\n")[0]
+        assert isinstance(node, MacroAssignment)
+        assert (node.name, node.op, node.value) == (
+            "$(pfx)-$($(x))-flags",
+            ":=",
+            "a  b",
+        )
+        # Operator spacing normalized; value whitespace is significant
+        assert _fmt("foo+=$(f, a  b )\nbar =\n") == "foo += $(f, a  b )\nbar =\n"
+
+    def test_macro_assignment_indented_in_block(self):
+        src = "if X\nfoo = 1\nendif\n"
+        out = _fmt(src, LinterConfig.espidf_preset())
+        assert out == "if X\n    foo = 1\n\nendif\n"
 
     def test_wrap_ignores_operators_inside_strings(self):
         config = LinterConfig.zephyr_preset()

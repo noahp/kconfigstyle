@@ -9,6 +9,8 @@
               | <if_block>
               | <source_statement>
               | <comment_statement>
+              | <mainmenu_statement>
+              | <macro_assignment>
               | <comment_line>
               | <empty_line>
 
@@ -25,13 +27,14 @@
                   | <select_option>
                   | <imply_option>
                   | <range_option>
+                  | "modules"
                   | <help_block>
                   | <comment_line>
 
 <type_definition> ::= <type> <prompt>
                     | <type>
 
-<type> ::= "bool" | "tristate" | "string" | "int" | "hex"
+<type> ::= "bool" | "boolean" | "tristate" | "string" | "int" | "hex"
          | "def_bool" <expr>
          | "def_tristate" <expr>
 
@@ -49,7 +52,10 @@
 
 <range_option> ::= "range" <expr> <expr> | "range" <expr> <expr> "if" <expr>
 
-<help_block> ::= "help" <newline> <help_text>
+<help_block> ::= <help_keyword> <newline> <help_text>
+
+; Kconfiglib accepts any dashes around 'help'
+<help_keyword> ::= "help" | "---help---" | "-"* "help" "-"*
 
 <help_text> ::= <indented_line> | <indented_line> <help_text>
 
@@ -62,6 +68,7 @@
                   | <type_definition>
                   | <default_option>
                   | <depends_option>
+                  | "optional"
                   | <help_block>
                   | <comment_line>
 
@@ -77,6 +84,20 @@
                      | "rsource" <string> <newline>
                      | "osource" <string> <newline>
                      | "orsource" <string> <newline>
+                     | "gsource" <string> <newline>
+                     | "grsource" <string> <newline>
+
+<mainmenu_statement> ::= "mainmenu" <string> <newline>
+
+; Preprocessor variable; <text> is kept verbatim
+<macro_assignment> ::= <macro_name> <assign_op> <text> <newline>
+                     | <macro_name> <assign_op> <newline>
+
+<assign_op> ::= "=" | ":=" | "+="
+
+<macro_name> ::= <macro_name_part> | <macro_name> <macro_name_part>
+
+<macro_name_part> ::= <letter> | <digit> | "_" | "-" | "$(" <text> ")"
 
 <comment_statement> ::= "comment" <string> <newline> <comment_option_list>
 
