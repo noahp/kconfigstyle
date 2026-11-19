@@ -7,17 +7,23 @@
 A simple style linter + formatter for Kconfig files, with support for Zephyr and
 ESP-IDF style conventions.
 
-Example:
+Lint (reports issues, exits non-zero if any are found):
 
 ```bash
-❯ uvx kconfigstyle --write --reflow-help --consolidate-empty-lines --max-line-length 80 Kconfig
+uvx kconfigstyle Kconfig
+```
+
+Format in place:
+
+```bash
+uvx kconfigstyle --write --reflow-help --consolidate-empty-lines --max-line-length 80 Kconfig
 ```
 
 Before:
 
-```bash
+```kconfig
 # incorrect and inconsistent indentation, spare newline, and unwrapped help text
-config MY_OPTION
+config FOO_MY_OPTION
   bool "Enable my option" if ANOTHER_OPTION
 
 
@@ -29,9 +35,9 @@ config MY_OPTION
 
 After:
 
-```bash
+```kconfig
 # properly indented, consolidated newlines, and wrapped help text
-config MY_OPTION
+config FOO_MY_OPTION
 	bool "Enable my option" if ANOTHER_OPTION
 
 	help
@@ -47,18 +53,15 @@ The "Kconfig language" is defined here:
 
 - https://docs.kernel.org/kbuild/kconfig-language.html
 
-There's several extensions used in practice by Zephyr + ESP-IDF; both projects maintain their own forks of the original `kconfiglib` library:
+Zephyr and ESP-IDF both use several extensions in practice, and each maintains
+its own fork of the original
+[Kconfiglib](https://github.com/ulfalizer/Kconfiglib):
 
-- https://github.com/zephyrproject-rtos/Kconfiglib (actively maintained fork
-  used by Zephyr, original library
-  [here](https://github.com/ulfalizer/Kconfiglib))
+- Zephyr: https://github.com/zephyrproject-rtos/Kconfiglib
+- ESP-IDF:
+  https://docs.espressif.com/projects/esp-idf-kconfig/en/latest/kconfiglib/index.html
 
-Espressif has an excellent documentation page here about their fork of
-Kconfiglib:
-
-- https://docs.espressif.com/projects/esp-idf-kconfig/en/latest/kconfiglib/index.html
-
-Which includes a parser
+Espressif's fork includes a parser
 [here](https://github.com/espressif/esp-idf-kconfig/blob/master/esp_kconfiglib/kconfig_parser.py),
 however, that is intended to be used on a complete Kconfig setup, not on a
 per-file basis (i.e. it wants to be able to load in sourced files etc). For the
@@ -91,13 +94,22 @@ pip install kconfigstyle
 kconfigstyle [options] <kconfig_files>
 ```
 
+## Presets
+
+| Preset             | Indent          | Help indent    | Max line | Other                                  |
+| ------------------ | --------------- | -------------- | -------- | -------------------------------------- |
+| `zephyr` (default) | tabs            | tab + 2 spaces | 100      |                                        |
+| `espidf`           | 4 spaces        | +4 spaces      | 120      | hierarchical indent, uppercase configs |
+
+Individual options override preset values.
+
 ## Command Line Options
 
 See `kconfigstyle --help` for a full list of options. Some notable options
 include:
 
 - `--preset {zephyr,espidf}`
-  Use a style preset (individual options override preset values)
+  Use a style preset (default: `zephyr`)
 
 - `--write, -w`
   Write formatted output back to files (format mode)
@@ -110,7 +122,8 @@ include:
   `--use-spaces` is set
 
 - `--help-indent HELP_INDENT`
-  Number of extra spaces for help text indentation (default: 2)
+  Number of extra spaces for help text indentation (default: 2 for Zephyr, 4
+  for ESP-IDF)
 
 - `--max-line-length MAX_LINE_LENGTH`
   Maximum line length (default: 100 for Zephyr, 120 for ESP-IDF)
@@ -122,7 +135,7 @@ include:
   Require config names to be uppercase
 
 - `--min-prefix-length MIN_PREFIX_LENGTH`
-  Minimum prefix length for config names (default: 3 for ESP-IDF)
+  Minimum prefix length for config names (default: 3; `0` disables the check)
 
 - `--indent-sub-items`
   Use hierarchical indentation for sub-items (ESP-IDF style)
@@ -133,6 +146,24 @@ include:
 - `--reflow-help`
   Reflow help text to fit within max line length
 
+- `--print-formatted`
+  Print formatted output to stdout without modifying files
+
+## Exit Status
+
+In lint mode (no `--write`), `kconfigstyle` exits `1` if any issues are found,
+otherwise `0`. With `--write`, it exits `0` and reports any remaining issues the
+formatter can't fix (e.g. naming).
+
+## Usage in CI
+
+Lint mode is suitable for CI checks, e.g. in a GitHub Actions workflow:
+
+```yaml
+- uses: astral-sh/setup-uv@v4
+- run: uvx kconfigstyle $(git ls-files '*Kconfig*')
+```
+
 ## License
 
-See LICENSE file for details.
+[MIT](LICENSE)
