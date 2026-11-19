@@ -6,12 +6,18 @@ import tempfile
 from pathlib import Path
 
 from kconfigstyle import (
+    ChoiceEntry,
     Comment,
+    CommentStatement,
     ConfigEntry,
+    HelpText,
+    IfBlock,
     KconfigLinter,
     KconfigParser,
     LinterConfig,
     MenuEntry,
+    SourceStatement,
+    UnknownLine,
 )
 
 
@@ -205,6 +211,7 @@ class TestESPIDFStyle:
             '        bool "Enable networking"\n',
             "        help\n",
             "            Enable network stack.\n",
+            "\n",
             "endmenu\n",
         ]
 
@@ -437,62 +444,66 @@ class TestFormatter:
             temp_path.unlink()
 
 
-class TestLineTypeDetection:
-    """Test line type detection."""
+class TestLineClassification:
+    """Test that the parser classifies each kind of line correctly."""
 
-    def test_detect_config(self):
-        """Test detection of config keyword."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
+    @staticmethod
+    def first(content: str):
+        return KconfigParser().parse(content)[0]
 
-        assert linter._get_line_type("config TEST") == "config"
-        assert linter._get_line_type("  config TEST") == "config"
+    def test_entries(self):
+        assert isinstance(self.first("config TEST"), ConfigEntry)
+        assert isinstance(self.first("  config TEST"), ConfigEntry)
+        assert self.first("menuconfig TEST").config_type == "menuconfig"
+        assert self.first("configdefault TEST").config_type == "configdefault"
 
-    def test_detect_menuconfig(self):
-        """Test detection of menuconfig keyword."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
+    def test_blocks(self):
+        assert isinstance(self.first('menu "Test"\nendmenu'), MenuEntry)
+        assert isinstance(self.first("choice\nendchoice"), ChoiceEntry)
+        assert isinstance(self.first("if FOO\nendif"), IfBlock)
+        assert isinstance(self.first('source "path"'), SourceStatement)
+        assert isinstance(self.first('comment "test"'), CommentStatement)
+        assert isinstance(self.first("# Comment"), Comment)
+        assert isinstance(self.first("  # Comment"), Comment)
+        assert isinstance(self.first("some random text"), UnknownLine)
 
-        assert linter._get_line_type("menuconfig TEST") == "menuconfig"
+    def test_keywords_need_word_boundary(self):
+        assert isinstance(self.first("choices_are_fun"), UnknownLine)
+        assert isinstance(self.first("menuish"), UnknownLine)
+        assert isinstance(self.first("if-success = $(shell,true)"), UnknownLine)
+        assert isinstance(self.first("source := foo"), UnknownLine)
 
-    def test_detect_help(self):
-        """Test detection of help keyword."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
+    def test_options(self):
+        cases = {
+            'bool "Test"': "bool",
+            "bool": "bool",
+            'int "Value"': "int",
+            'string "Text"': "string",
+            'tristate "Test"': "tristate",
+            'hex "Value"': "hex",
+            "def_bool y": "def_bool",
+            "def_tristate y": "def_tristate",
+            "def_int 3": "def_int",
+            "def_hex 0x10": "def_hex",
+            'def_string "x"': "def_string",
+            'prompt "Text"': "prompt",
+            "default y": "default",
+            "depends on FOO": "depends_on",
+            "visible if FOO": "visible_if",
+            "select FOO": "select",
+            "imply BAR": "imply",
+            "range 0 100": "range",
+            'option env="VAR"': "option",
+        }
+        for line, expected in cases.items():
+            entry = self.first(f"config X\n\t{line}\n")
+            assert entry.options[0].option_type == expected, line
 
-        assert linter._get_line_type("help") == "help"
-        assert linter._get_line_type("\thelp") == "help"
-
-    def test_detect_bool(self):
-        """Test detection of bool option."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        assert linter._get_line_type('\tbool "Test"') == "option"
-        assert linter._get_line_type('\tint "Value"') == "option"
-        assert linter._get_line_type('\tstring "Text"') == "option"
-
-    def test_detect_depends(self):
-        """Test detection of depends on."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        assert linter._get_line_type("\tdepends on FOO") == "option"
-
-    def test_visible_if(self):
-        """Test detection of visible if."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        assert linter._get_line_type("\tvisible if FOO") == "option"
-
-    def test_detect_comment(self):
-        """Test detection of comments."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        assert linter._get_line_type("# Comment") == "comment_line"
-        assert linter._get_line_type("  # Comment") == "comment_line"
+    def test_help(self):
+        entry = self.first("config X\n\tbool\n\thelp\n\t  text\n")
+        assert isinstance(entry.options[1], HelpText)
+        entry = self.first("config X\n\tbool\n\t---help---\n\t  text\n")
+        assert isinstance(entry.options[1], HelpText)
 
 
 class TestConfigNameValidation:
@@ -676,34 +687,6 @@ class TestEdgeCases:
         finally:
             temp_path.unlink()
 
-    def test_all_line_types(self):
-        """Test detection of all line types."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        assert linter._get_line_type('menu "Test"') == "menu"
-        assert linter._get_line_type("endmenu") == "endmenu"
-        assert linter._get_line_type("choice") == "choice"
-        assert linter._get_line_type("endchoice") == "endchoice"
-        assert linter._get_line_type("if FOO") == "if"
-        assert linter._get_line_type("endif") == "endif"
-        assert linter._get_line_type('source "path"') == "source"
-        assert linter._get_line_type('comment "test"') == "comment"
-        assert linter._get_line_type('\ttristate "Test"') == "option"
-        assert linter._get_line_type('\thex "Value"') == "option"
-        assert linter._get_line_type("\tdef_bool y") == "option"
-        assert linter._get_line_type("\tdef_tristate y") == "option"
-        assert linter._get_line_type("\tdef_int 3") == "option"
-        assert linter._get_line_type("\tdef_hex 0x10") == "option"
-        assert linter._get_line_type('\tdef_string "x"') == "option"
-        assert linter._get_line_type('\tprompt "Text"') == "option"
-        assert linter._get_line_type("\tdefault y") == "option"
-        assert linter._get_line_type("\tselect FOO") == "option"
-        assert linter._get_line_type("\timply BAR") == "option"
-        assert linter._get_line_type("\trange 0 100") == "option"
-        assert linter._get_line_type('\toption env="VAR"') == "option"
-        assert linter._get_line_type("some random text") == "other"
-
     def test_config_name_without_underscore(self):
         """Test config name validation without underscore."""
         config = LinterConfig.espidf_preset()
@@ -723,15 +706,6 @@ class TestEdgeCases:
             assert not any("prefix" in issue.message.lower() for issue in issues)
         finally:
             temp_path.unlink()
-
-    def test_invalid_config_line(self):
-        """Test config line that doesn't match pattern."""
-        config = LinterConfig.zephyr_preset()
-        linter = KconfigLinter(config)
-
-        # _check_config_name should handle lines that don't match
-        linter._check_config_name("config", 1)
-        assert len(linter.issues) == 0  # Should not crash or add issues
 
     def test_comment_with_only_hash(self):
         """Test single # character without text."""
@@ -3686,3 +3660,163 @@ class TestCoverageImprovements:
                 assert "default" in formatted_text
             finally:
                 temp_path.unlink()
+
+
+def _fmt(content: str, config: LinterConfig | None = None) -> str:
+    linter = KconfigLinter(config or LinterConfig.zephyr_preset())
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "Kconfig"
+        path.write_text(content)
+        lines, issues = linter.format_file(path)
+    assert not issues
+    return "".join(lines)
+
+
+def _lint(content: str, config: LinterConfig | None = None):
+    linter = KconfigLinter(config or LinterConfig.zephyr_preset())
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "Kconfig"
+        path.write_text(content)
+        return linter.lint_file(path)
+
+
+class TestRegressions:
+    """Regression tests for parser/formatter/linter bugs."""
+
+    def test_hash_inside_string_is_not_a_comment(self):
+        src = 'config A\n\tstring "x"\n\tdefault "#000"  # color\n'
+        assert _fmt(src) == src
+
+    def test_inline_comments_on_block_headers(self):
+        src = (
+            'menu "Foo"  # menu\n'
+            "\n"
+            "if BAR  # cond\n"
+            "\n"
+            'source "x/Kconfig"  # src\n'
+            "\n"
+            "endif  # BAR\n"
+            "\n"
+            "endmenu  # Foo\n"
+        )
+        assert _fmt(src) == src
+
+    def test_tab_after_keyword(self):
+        src = 'config\tFOO\n\tbool\n\nsource\t"x"\n'
+        assert _fmt(src) == 'config FOO\n\tbool\n\nsource "x"\n'
+
+    def test_if_inside_prompt_string_is_not_a_condition(self):
+        entry = KconfigParser().parse('config A\n\tbool "Enable if present"\n')[0]
+        assert entry.options[0].value == '"Enable if present"'
+        assert entry.options[0].condition == ""
+
+    def test_comment_in_choice_stays_with_its_entry(self):
+        src = (
+            "choice\n"
+            '\tprompt "Pick"\n'
+            "\n"
+            "config C1\n"
+            '\tbool "c1"\n'
+            "\n"
+            "# about C2\n"
+            "config C2\n"
+            '\tbool "c2"\n'
+            "\n"
+            "endchoice\n"
+        )
+        assert _fmt(src) == src
+
+    def test_choice_accepts_configdefault_and_comment(self):
+        choice = KconfigParser().parse(
+            'choice\n\tprompt "p"\n\nconfigdefault C1\n\tdefault y\n\n'
+            'comment "hi"\n\nendchoice\n'
+        )[0]
+        assert [type(e) for e in choice.entries] == [ConfigEntry, CommentStatement]
+        assert choice.entries[0].config_type == "configdefault"
+
+    def test_endchoice_aligned_with_choice_espidf(self):
+        src = (
+            'menu "M"\n'
+            "    choice\n"
+            '        prompt "p"\n'
+            "\n"
+            "        config C1\n"
+            '            bool "c1"\n'
+            "\n"
+            "    endchoice\n"
+            "\n"
+            "endmenu\n"
+        )
+        assert _fmt(src, LinterConfig.espidf_preset()) == src
+
+    def test_line_numbers_are_one_based_and_survive_continuations(self):
+        src = (
+            "# hdr\n"
+            "config A\n"
+            '\tbool "x"\n'
+            "\tdepends on B && \\\n"
+            "\t\tC\n"
+            "\n"
+            "config lower\n"
+            "\tbool\n"
+        )
+        config = LinterConfig.zephyr_preset()
+        config.enforce_uppercase_configs = True
+        issues = [i for i in _lint(src, config) if "uppercase" in i.message]
+        assert [i.line_number for i in issues] == [7]
+
+    def test_help_text_trailing_backslash_not_joined(self):
+        src = "config A\n\tbool\n\thelp\n\t  path C:\\\n\t  next line\n"
+        assert _fmt(src) == src
+
+    def test_empty_help_does_not_swallow_next_config(self):
+        ast = KconfigParser().parse("config A\n\tbool\n\thelp\nconfig B\n\tbool\n")
+        assert [n.name for n in ast if isinstance(n, ConfigEntry)] == ["A", "B"]
+
+    def test_wrap_ignores_operators_inside_strings(self):
+        config = LinterConfig.zephyr_preset()
+        config.max_line_length = 40
+        out = _fmt('config A\n\tdefault "a && b && c && d && e" if X && Y\n', config)
+        assert '"a && b && c && d && e"' in out
+
+    def test_lint_flags_whatever_format_would_change(self):
+        src = "config A\n\tbool\nconfig B\n\tbool\n"
+        issues = _lint(src)
+        assert any("--write" in i.message for i in issues)
+        assert _lint(_fmt(src)) == []
+
+    def test_lint_reports_parse_error_instead_of_raising(self):
+        issues = _lint("config A\n\tbool\n\thelp\nunindented text\n")
+        assert any("Help text must be indented" in i.message for i in issues)
+
+
+class TestCLIRegressions:
+    @staticmethod
+    def run(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "kconfigstyle", *map(str, args)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_write_skips_unchanged_file(self, tmp_path):
+        path = tmp_path / "Kconfig"
+        path.write_text("config A\n\tbool\n")
+        before = path.stat().st_mtime_ns
+        self.run("--write", path)
+        assert path.stat().st_mtime_ns == before
+
+    def test_write_does_not_clobber_on_parse_error(self, tmp_path):
+        path = tmp_path / "Kconfig"
+        src = "config A\n\tbool\n\thelp\nunindented text\n"
+        path.write_text(src)
+        result = self.run("--write", path)
+        assert path.read_text() == src
+        assert "not formatted" in result.stdout
+
+    def test_dump_ast_handles_multiple_files(self, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.write_text("config A\n")
+        b.write_text("config B\n")
+        out = self.run("--dump-ast", a, b).stdout
+        assert "name='A'" in out and "name='B'" in out

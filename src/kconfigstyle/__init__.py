@@ -6,10 +6,11 @@ This implementation uses a parser to build an AST, then formats by traversing th
 """
 
 import argparse
+import difflib
 import re
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Literal
 
@@ -39,30 +40,17 @@ class LinterConfig:
     @classmethod
     def zephyr_preset(cls) -> "LinterConfig":
         """Create a Zephyr style preset configuration."""
-        return cls(
-            use_spaces=False,
-            primary_indent_spaces=4,
-            help_indent_spaces=2,
-            max_line_length=100,
-            max_option_name_length=50,
-            enforce_uppercase_configs=False,
-            indent_sub_items=False,
-            consolidate_empty_lines=False,
-        )
+        return cls()
 
     @classmethod
     def espidf_preset(cls) -> "LinterConfig":
         """Create an ESP-IDF style preset configuration."""
         return cls(
             use_spaces=True,
-            primary_indent_spaces=4,
             help_indent_spaces=4,
             max_line_length=120,
-            max_option_name_length=50,
-            min_prefix_length=3,
             enforce_uppercase_configs=True,
             indent_sub_items=True,
-            consolidate_empty_lines=False,
         )
 
 
@@ -80,37 +68,27 @@ class LintIssue:
         return f"Line {self.line_number}{col_str}: [{self.severity}] {self.message}"
 
 
-# AST Node Types
+# AST Node Types. line_number is 1-based, matching lint output.
 
 
 @dataclass
 class ASTNode:
-    """Base class for AST nodes."""
-
     line_number: int = 0
-    inline_comment: str = ""  # Inline comment (e.g., "# comment")
+    inline_comment: str = ""  # e.g. "# comment"
 
 
 @dataclass
 class Comment(ASTNode):
-    """Comment line."""
-
-    line_number: int = 0
     text: str = ""  # Without the leading #
 
 
 @dataclass
 class EmptyLine(ASTNode):
-    """Empty line."""
-
-    line_number: int = 0
+    pass
 
 
 @dataclass
 class HelpText(ASTNode):
-    """Help text block."""
-
-    line_number: int = 0
     lines: list[str] = field(default_factory=list)  # Stripped text lines
 
 
@@ -118,62 +96,43 @@ class HelpText(ASTNode):
 class ConfigOption(ASTNode):
     """A config option like 'bool', 'default', 'depends on', 'visible if', etc."""
 
-    line_number: int = 0
-    option_type: str = ""  # 'bool', 'default', 'depends_on', 'visible_if', 'select'
-    value: str = ""  # The rest of the line
-    condition: str = ""  # Optional 'if' condition
+    option_type: str = ""  # 'bool', 'default', 'depends_on', 'visible_if', ...
+    value: str = ""
+    condition: str = ""  # Optional trailing 'if' condition
 
 
 @dataclass
 class ConfigEntry(ASTNode):
-    """A config or menuconfig entry."""
-
-    line_number: int = 0
     config_type: Literal["config", "configdefault", "menuconfig"] = "config"
     name: str = ""
-    options: list[ASTNode] = field(
-        default_factory=list
-    )  # ConfigOption, Comment, HelpText
+    options: list[ASTNode] = field(default_factory=list)
 
 
 @dataclass
 class ChoiceEntry(ASTNode):
-    """A choice block."""
-
-    line_number: int = 0
-    name: str = ""  # Optional name
-    options: list[ASTNode] = field(
-        default_factory=list
-    )  # ConfigOption, Comment, HelpText
-    entries: list[ASTNode] = field(
-        default_factory=list
-    )  # Config entries, if blocks, etc. within choice
+    name: str = ""
+    options: list[ASTNode] = field(default_factory=list)
+    entries: list[ASTNode] = field(default_factory=list)
+    end_comment: str = ""
 
 
 @dataclass
 class MenuEntry(ASTNode):
-    """A menu block."""
-
-    line_number: int = 0
     title: str = ""
     options: list[ConfigOption] = field(default_factory=list)
     statements: list[ASTNode] = field(default_factory=list)
+    end_comment: str = ""
 
 
 @dataclass
 class IfBlock(ASTNode):
-    """An if/endif block."""
-
-    line_number: int = 0
     condition: str = ""
     statements: list[ASTNode] = field(default_factory=list)
+    end_comment: str = ""
 
 
 @dataclass
 class SourceStatement(ASTNode):
-    """A source/rsource statement."""
-
-    line_number: int = 0
     source_type: str = "source"  # 'source', 'rsource', 'osource', 'orsource'
     path: str = ""
 
@@ -182,785 +141,447 @@ class SourceStatement(ASTNode):
 class CommentStatement(ASTNode):
     """A 'comment' statement (visible comment in menuconfig)."""
 
-    line_number: int = 0
     text: str = ""
     depends: list[str] = field(default_factory=list)
 
 
 @dataclass
 class UnknownLine(ASTNode):
-    """An unknown/unrecognized line that should be preserved as-is."""
+    """An unrecognized line, preserved as-is."""
 
-    line_number: int = 0
     text: str = ""
+
+
+BLOCK_TYPES = (ConfigEntry, ChoiceEntry, MenuEntry, IfBlock, CommentStatement)
+
+TYPE_KEYWORDS = ("bool", "tristate", "string", "int", "hex")
+
+_STRUCTURAL_RE = re.compile(
+    r"^(config|configdefault|menuconfig|choice|endchoice|menu|endmenu|if|endif"
+    r"|source|rsource|osource|orsource|comment|mainmenu)"
+    # Not a prefix of a longer word (if-success) or a macro assignment (if := x)
+    r"(?![\w-])(?!\s*[:+]?=)"
+)
+_OPTION_RE = re.compile(
+    r"^(bool|tristate|string|int|hex|def_bool|def_tristate|def_int|def_hex"
+    r"|def_string|prompt|default|select|imply|range|option|depends\s+on"
+    r"|visible\s+if)(?:\s+(.*))?$"
+)
+_HELP_RE = re.compile(r"^(?:help|---help---)(?:\s|$)")
+
+
+def _mask_quotes(s: str) -> str:
+    """Return s with quoted string contents replaced by '_' (same length).
+
+    Lets callers search for '#', ' if ', '&&' etc. without matching inside strings.
+    """
+    out = []
+    quote = None
+    escaped = False
+    for c in s:
+        if quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+                out.append(c)
+                continue
+            out.append("_")
+        else:
+            if c in "\"'":
+                quote = c
+            out.append(c)
+    return "".join(out)
+
+
+def _split_comment(s: str) -> tuple[str, str]:
+    """Split a line into (code, inline_comment), ignoring '#' inside strings."""
+    pos = _mask_quotes(s).find("#")
+    if pos == -1:
+        return s.rstrip(), ""
+    return s[:pos].rstrip(), s[pos:].rstrip()
+
+
+def _split_condition(value: str) -> tuple[str, str]:
+    """Split 'VALUE if COND' into (VALUE, COND), ignoring ' if ' inside strings."""
+    pos = _mask_quotes(value).rfind(" if ")
+    if pos == -1:
+        return value.strip(), ""
+    return value[:pos].strip(), value[pos + 4 :].strip()
+
+
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _is_structural(stripped: str) -> bool:
+    return _STRUCTURAL_RE.match(stripped) is not None
+
+
+def _is_option(stripped: str) -> bool:
+    code = _split_comment(stripped)[0]
+    return _OPTION_RE.match(code) is not None or _HELP_RE.match(code) is not None
+
+
+def _keyword_rest(code: str, keyword: str) -> str:
+    return code[len(keyword) :].strip()
 
 
 class KconfigParser:
     """Parser for Kconfig files."""
 
     def __init__(self):
-        self.lines: list[str] = []
+        self.raw: list[str] = []
         self.pos: int = 0
-        self.current_line_num: int = 0
+        # 1-based line numbers of help text bodies, for linting
+        self.help_lines: set[int] = set()
 
     def parse(self, content: str) -> list[ASTNode]:
         """Parse Kconfig content into an AST."""
-        # First, join continuation lines
-        self.lines = self._join_continuation_lines(content.splitlines())
+        self.raw = content.splitlines()
         self.pos = 0
-        self.current_line_num = 0
+        self.help_lines = set()
 
         statements = []
-        while self.pos < len(self.lines):
-            stmt = self._parse_statement()
-            if stmt:
-                statements.append(stmt)
-            else:
-                self.pos += 1
-                self.current_line_num += 1
-
+        while self.pos < len(self.raw):
+            statements.append(self._parse_statement())
         return statements
 
-    def _join_continuation_lines(self, lines: list[str]) -> list[str]:
-        """Join lines that end with backslash continuation."""
-        result = []
-        i = 0
+    # Line access. Backslash continuations are joined lazily (not up front) so
+    # help text is read verbatim and line numbers stay accurate.
 
-        while i < len(lines):
-            line = lines[i]
-
-            # Check if this line ends with backslash
-            if line.rstrip().endswith("\\"):
-                # Collect all continuation lines
-                joined = line.rstrip()[:-1].rstrip()  # Remove \\ and trailing space
-                i += 1
-
-                # Keep joining while we have continuations
-                while i < len(lines):
-                    next_line = lines[i]
-                    stripped = next_line.lstrip()
-
-                    if next_line.rstrip().endswith("\\"):
-                        # Another continuation
-                        joined += " " + stripped[:-1].rstrip()
-                        i += 1
-                    else:
-                        # Last line of continuation
-                        joined += " " + stripped
-                        i += 1
-                        break
-
-                result.append(joined)
-            else:
-                result.append(line)
-                i += 1
-
-        return result
+    def _logical(self) -> tuple[str, int]:
+        """Return (joined line, number of raw lines it spans) at pos."""
+        text = self.raw[self.pos]
+        span = 1
+        while text.rstrip().endswith("\\"):
+            text = text.rstrip()[:-1].rstrip()
+            if self.pos + span >= len(self.raw):
+                break
+            text += " " + self.raw[self.pos + span].strip()
+            span += 1
+        return text, span
 
     def _current_line(self) -> str:
-        """Get current line."""
-        if self.pos >= len(self.lines):
-            return ""
-        return self.lines[self.pos]
-
-    def _peek_line(self, offset: int = 1) -> str:
-        """Peek at a future line."""
-        idx = self.pos + offset
-        if idx >= len(self.lines):
-            return ""
-        return self.lines[idx]
+        return self._logical()[0] if self.pos < len(self.raw) else ""
 
     def _advance(self):
-        """Move to next line."""
-        self.pos += 1
-        self.current_line_num += 1
+        self.pos += self._logical()[1]
 
-    def _extract_inline_comment(self, line: str) -> tuple[str, str]:
-        """Extract inline comment from a line.
+    @property
+    def _line_number(self) -> int:
+        return self.pos + 1
 
-        Returns:
-            Tuple of (line_without_comment, comment_with_hash)
+    def _comment_node(self, stripped: str) -> Comment:
+        node = Comment(text=stripped[1:].strip(), line_number=self._line_number)
+        self._advance()
+        return node
 
-        Note: This does NOT handle comments inside quoted strings.
-        """
-        # Simple approach: find # and split there
-        # TODO: Handle # inside quoted strings properly
-        comment_pos = line.find("#")
-        if comment_pos == -1:
-            return line, ""
-
-        # Everything before # is the code, everything from # is the comment
-        code_part = line[:comment_pos].rstrip()
-        comment_part = line[comment_pos:].rstrip()
-
-        return code_part, comment_part
-
-    def _parse_statement(self) -> ASTNode | None:
-        """Parse a top-level statement."""
+    def _parse_statement(self) -> ASTNode:
         line = self._current_line()
         stripped = line.lstrip()
 
-        # Empty line
         if not stripped:
-            node = EmptyLine(line_number=self.current_line_num)
+            node = EmptyLine(line_number=self._line_number)
             self._advance()
             return node
 
-        # Comment
         if stripped.startswith("#"):
-            text = stripped[1:].strip() if len(stripped) > 1 else ""
-            node = Comment(text=text, line_number=self.current_line_num)
-            self._advance()
-            return node
+            return self._comment_node(stripped)
 
-        # Config/menuconfig
-        if stripped.startswith(("config ", "configdefault ")):
-            return self._parse_config_entry()
+        m = _STRUCTURAL_RE.match(stripped)
+        parser = m and {
+            "config": self._parse_config_entry,
+            "configdefault": self._parse_config_entry,
+            "menuconfig": self._parse_config_entry,
+            "choice": self._parse_choice,
+            "menu": self._parse_menu,
+            "if": self._parse_if_block,
+            "source": self._parse_source,
+            "rsource": self._parse_source,
+            "osource": self._parse_source,
+            "orsource": self._parse_source,
+            "comment": self._parse_comment_statement,
+        }.get(m.group(1))
+        if parser:
+            return parser()
 
-        if stripped.startswith("menuconfig "):
-            return self._parse_menuconfig_entry()
-
-        # Choice
-        if stripped.startswith("choice"):
-            return self._parse_choice()
-
-        # Menu
-        if stripped.startswith("menu "):
-            return self._parse_menu()
-
-        # If
-        if stripped.startswith("if "):
-            return self._parse_if_block()
-
-        # Source statements
-        if stripped.startswith(("source ", "rsource ", "osource ", "orsource ")):
-            return self._parse_source()
-
-        # Comment statement
-        if stripped.startswith("comment "):
-            return self._parse_comment_statement()
-
-        # Unknown - preserve as-is
-        node = UnknownLine(text=line, line_number=self.current_line_num)
+        node = UnknownLine(text=line, line_number=self._line_number)
         self._advance()
         return node
 
     def _parse_config_entry(self) -> ConfigEntry:
         """Parse a config, configdefault or menuconfig entry."""
         line = self._current_line()
-        stripped = line.lstrip()
-
-        # Extract inline comment
-        stripped_no_comment, inline_comment = self._extract_inline_comment(stripped)
-
-        if stripped_no_comment.startswith("menuconfig "):
-            config_type = "menuconfig"
-            name = stripped_no_comment[11:].strip()
-        elif stripped_no_comment.startswith("configdefault "):
-            config_type = "configdefault"
-            name = stripped_no_comment[14:].strip()
-        else:
-            config_type = "config"
-            name = stripped_no_comment[7:].strip()
+        code, inline_comment = _split_comment(line.lstrip())
+        config_type, name = (code.split(None, 1) + [""])[:2]
 
         node = ConfigEntry(
             config_type=config_type,
-            name=name,
-            line_number=self.current_line_num,
+            name=name.strip(),
+            line_number=self._line_number,
             inline_comment=inline_comment,
         )
 
-        # Track the indentation level of the config entry itself. A blank line
-        # followed by content at (or below) this level marks the end of the
-        # config; any leading comment there belongs to the next entry, not this
-        # one. seen_content guards against ending before any options are parsed.
-        config_indent = len(line) - len(stripped)
+        # A blank line followed by content at (or below) the config keyword's
+        # own indent ends the entry; a comment there belongs to the next entry.
+        # seen_content guards against ending before any options are parsed.
+        config_indent = _indent_of(line)
         seen_content = False
 
         self._advance()
 
-        # Parse options until we hit a structural keyword or end
-        while self.pos < len(self.lines):
+        while self.pos < len(self.raw):
             line = self._current_line()
             stripped = line.lstrip()
 
-            # Empty line within config
             if not stripped:
-                # Check if next non-empty line is a structural keyword or unindented
-                peek_pos = self.pos + 1
-                found_content = False
-                while peek_pos < len(self.lines):
-                    peek_line = self.lines[peek_pos]
-                    peek_stripped = peek_line.lstrip()
-                    if peek_stripped:  # Found non-empty line
-                        # Check if it's structural keyword - always end config
-                        if self._is_structural_keyword(peek_stripped):
-                            return node
-                        # Check if it's unindented - end config unless it's clearly part of config
-                        if peek_line[0] not in (" ", "\t"):
-                            # After blank lines, unindented content ends the config
-                            # (even if it's a comment or config option keyword)
-                            return node
-                        # Indented content at (or below) the config keyword's own
-                        # level is a sibling - e.g. a comment introducing the next
-                        # config - so end this config entry.
-                        peek_indent = len(peek_line) - len(peek_stripped)
-                        if seen_content and peek_indent <= config_indent:
-                            return node
-                        found_content = True
-                        break
-                    peek_pos += 1
-
-                # If we didn't find any more content, end the config
-                if not found_content:
+                if not self._blank_continues_config(config_indent, seen_content):
                     return node
-
-                # Otherwise, this empty line is part of the config
-                node.options.append(EmptyLine(line_number=self.current_line_num))
+                node.options.append(EmptyLine(line_number=self._line_number))
                 self._advance()
                 continue
 
-            # Structural keywords end the config block
-            if self._is_structural_keyword(stripped):
+            if _is_structural(stripped):
                 break
 
-            # Unindented lines: allow config option keywords and comments, but only if not after empty lines
-            if line and line[0] not in (" ", "\t"):
-                # If this is not a config option keyword or comment, end the block
-                if not self._is_config_option_keyword(
-                    stripped
-                ) and not stripped.startswith("#"):
-                    break
+            # Unindented lines continue the config only if they look like options
+            if line[0] not in " \t" and not (
+                _is_option(stripped) or stripped.startswith("#")
+            ):
+                break
 
-            # Comment within config
-            if stripped.startswith("#"):
-                seen_content = True
-                text = stripped[1:].strip() if len(stripped) > 1 else ""
-                node.options.append(
-                    Comment(text=text, line_number=self.current_line_num)
-                )
-                self._advance()
-                continue
-
-            # Help block
-            if stripped.startswith("help"):
-                seen_content = True
-                node.options.append(self._parse_help_block())
-                continue
-
-            # Config option
-            option = self._parse_config_option()
-            if option:
-                seen_content = True
-                node.options.append(option)
-            else:
-                # Unknown line within config - preserve it
-                node.options.append(
-                    UnknownLine(text=line, line_number=self.current_line_num)
-                )
-                self._advance()
+            seen_content = True
+            node.options.append(self._parse_option_line())
 
         return node
 
-    def _parse_menuconfig_entry(self) -> ConfigEntry:
-        """Parse a menuconfig entry (similar to config but can be a menu parent)."""
+    def _blank_continues_config(self, config_indent: int, seen_content: bool) -> bool:
+        """Whether the blank line at pos is inside the current config entry."""
+        for peek in self.raw[self.pos + 1 :]:
+            peek_stripped = peek.lstrip()
+            if not peek_stripped:
+                continue
+            if _is_structural(peek_stripped) or peek[0] not in " \t":
+                return False
+            return not (seen_content and _indent_of(peek) <= config_indent)
+        return False
+
+    def _parse_option_line(self) -> ASTNode:
+        """Parse a comment, help block, option, or unknown line inside a block."""
         line = self._current_line()
         stripped = line.lstrip()
-
-        # Extract inline comment
-        stripped_no_comment, inline_comment = self._extract_inline_comment(stripped)
-
-        config_type = "menuconfig"
-        name = stripped_no_comment[11:].strip()
-
-        node = ConfigEntry(
-            config_type=config_type,
-            name=name,
-            line_number=self.current_line_num,
-            inline_comment=inline_comment,
-        )
-
-        # See _parse_config_entry for the rationale behind config_indent /
-        # seen_content: a blank line followed by content at (or below) the
-        # config keyword's own indent marks the end of this entry.
-        config_indent = len(line) - len(stripped)
-        seen_content = False
-
+        if stripped.startswith("#"):
+            return self._comment_node(stripped)
+        if _HELP_RE.match(stripped):
+            return self._parse_help_block()
+        option = self._parse_config_option()
+        if option:
+            return option
+        node = UnknownLine(text=line, line_number=self._line_number)
         self._advance()
-
-        # Parse options until we hit a structural keyword or end
-        while self.pos < len(self.lines):
-            line = self._current_line()
-            stripped = line.lstrip()
-
-            # Empty line within config
-            if not stripped:
-                # Check if next non-empty line is a structural keyword or unindented
-                peek_pos = self.pos + 1
-                found_content = False
-                while peek_pos < len(self.lines):
-                    peek_line = self.lines[peek_pos]
-                    peek_stripped = peek_line.lstrip()
-                    if peek_stripped:  # Found non-empty line
-                        # Check if it's structural keyword - always end config
-                        if self._is_structural_keyword(peek_stripped):
-                            return node
-                        # Check if it's unindented - end config unless it's clearly part of config
-                        if peek_line[0] not in (" ", "\t"):
-                            # After blank lines, unindented content ends the config
-                            # (even if it's a comment or config option keyword)
-                            return node
-                        # Indented content at (or below) the config keyword's own
-                        # level is a sibling - e.g. a comment introducing the next
-                        # config - so end this config entry.
-                        peek_indent = len(peek_line) - len(peek_stripped)
-                        if seen_content and peek_indent <= config_indent:
-                            return node
-                        found_content = True
-                        break
-                    peek_pos += 1
-
-                # If we didn't find any more content, end the config
-                if not found_content:
-                    return node
-
-                # Otherwise, this empty line is part of the config
-                node.options.append(EmptyLine(line_number=self.current_line_num))
-                self._advance()
-                continue
-
-            # Structural keywords end the config block
-            if self._is_structural_keyword(stripped):
-                break
-
-            # Unindented lines: allow config option keywords and comments, but only if not after empty lines
-            if line and line[0] not in (" ", "\t"):
-                # If this is not a config option keyword or comment, end the block
-                if not self._is_config_option_keyword(
-                    stripped
-                ) and not stripped.startswith("#"):
-                    break
-
-            # Comment within config
-            if stripped.startswith("#"):
-                seen_content = True
-                text = stripped[1:].strip() if len(stripped) > 1 else ""
-                node.options.append(
-                    Comment(text=text, line_number=self.current_line_num)
-                )
-                self._advance()
-                continue
-
-            # Help block
-            if stripped.startswith("help"):
-                seen_content = True
-                node.options.append(self._parse_help_block())
-                continue
-
-            # Config option
-            option = self._parse_config_option()
-            if option:
-                seen_content = True
-                node.options.append(option)
-            else:
-                # Unknown line within config - preserve it
-                node.options.append(
-                    UnknownLine(text=line, line_number=self.current_line_num)
-                )
-                self._advance()
-
         return node
-
-    def _is_structural_keyword(self, stripped: str) -> bool:
-        """Check if line starts with a structural keyword."""
-        keywords = [
-            "config ",
-            "configdefault ",
-            "menuconfig ",
-            "choice",
-            "endchoice",
-            "menu ",
-            "endmenu",
-            "if ",
-            "endif",
-            "source ",
-            "rsource ",
-            "osource ",
-            "orsource ",
-            "comment ",
-            "mainmenu ",
-        ]
-        return any(stripped.startswith(kw) for kw in keywords)
-
-    def _is_config_option_keyword(self, stripped: str) -> bool:
-        """Check if line starts with a config option keyword."""
-        keywords = [
-            "bool",
-            "tristate",
-            "string",
-            "int",
-            "hex",
-            "def_bool",
-            "def_tristate",
-            "def_int",
-            "def_hex",
-            "def_string",
-            "prompt",
-            "default",
-            "depends on",
-            "depends",
-            "select",
-            "imply",
-            "range",
-            "option",
-            "help",
-        ]
-        return any(stripped.startswith(kw) for kw in keywords)
 
     def _parse_config_option(self) -> ConfigOption | None:
         """Parse a config option like 'bool', 'default', etc."""
-        line = self._current_line()
-        stripped = line.lstrip()
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        m = _OPTION_RE.match(code)
+        if not m:
+            return None
+        option_type = re.sub(r"\s+", "_", m.group(1))
+        raw_value = m.group(2) or ""
+        if not raw_value and option_type not in TYPE_KEYWORDS:
+            return None
 
-        # Extract inline comment
-        stripped_no_comment, inline_comment = self._extract_inline_comment(stripped)
-
-        # Match option types
-        patterns = {
-            "bool": r"^bool(\s+(.*))?$",
-            "tristate": r"^tristate(\s+(.*))?$",
-            "string": r"^string(\s+(.*))?$",
-            "int": r"^int(\s+(.*))?$",
-            "hex": r"^hex(\s+(.*))?$",
-            "def_bool": r"^def_bool\s+(.+)$",
-            "def_tristate": r"^def_tristate\s+(.+)$",
-            "def_int": r"^def_int\s+(.+)$",
-            "def_hex": r"^def_hex\s+(.+)$",
-            "def_string": r"^def_string\s+(.+)$",
-            "prompt": r"^prompt\s+(.+)$",
-            "visible_if": r"^visible\s+if\s+(.+)$",
-            "default": r"^default\s+(.+)$",
-            "depends_on": r"^depends\s+on\s+(.+)$",
-            "select": r"^select\s+(.+)$",
-            "imply": r"^imply\s+(.+)$",
-            "range": r"^range\s+(.+)$",
-            "option": r"^option\s+(.+)$",
-        }
-
-        for opt_type, pattern in patterns.items():
-            match = re.match(pattern, stripped_no_comment)
-            if match:
-                if opt_type in ["bool", "tristate", "string", "int", "hex"]:
-                    # For type definitions, group 2 contains the optional prompt
-                    value = ""
-                    if match.groups() and len(match.groups()) >= 2:
-                        value = match.group(2) if match.group(2) else ""
-                else:
-                    value = match.group(1) if match.groups() else ""
-
-                # Check for 'if' condition
-                condition = ""
-                if value and " if " in value:
-                    parts = value.rsplit(" if ", 1)
-                    value = parts[0].strip()
-                    condition = parts[1].strip()
-
-                node = ConfigOption(
-                    option_type=opt_type,
-                    value=value.strip() if value else "",
-                    condition=condition,
-                    line_number=self.current_line_num,
-                    inline_comment=inline_comment,
-                )
-                self._advance()
-                return node
-
-        # Unknown option type; caller decides how to consume the line
-        return None
+        value, condition = _split_condition(raw_value)
+        node = ConfigOption(
+            option_type=option_type,
+            value=value,
+            condition=condition,
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
+        self._advance()
+        return node
 
     def _parse_help_block(self) -> HelpText:
-        """Parse a help text block."""
-        node = HelpText(line_number=self.current_line_num)
+        """Parse a help text block. Operates on raw lines (no continuation joining)."""
+        node = HelpText(line_number=self._line_number)
         self._advance()  # Skip 'help' line
 
-        # Determine help text indentation from first non-empty line
         help_indent = None
-
-        while self.pos < len(self.lines):
-            line = self._current_line()
+        while self.pos < len(self.raw):
+            line = self.raw[self.pos]
             stripped = line.lstrip()
 
-            # Empty line within help - check what follows
             if not stripped:
-                # Peek at next line to see if help continues
-                next_line = self._peek_line()
-                if next_line:
-                    next_stripped = next_line.lstrip()
-                    # If next line is unindented structural keyword, end help
-                    if next_line[0] not in (" ", "\t") and self._is_structural_keyword(
-                        next_stripped
-                    ):
+                next_line = (
+                    self.raw[self.pos + 1] if self.pos + 1 < len(self.raw) else ""
+                )
+                if next_line.strip():
+                    if next_line[0] not in " \t":
                         break
-                    # If next line is unindented and not empty, end help
-                    if next_line[0] not in (" ", "\t") and next_line.strip():
+                    # Dedent past the help text ends the block. Leave the blank
+                    # line so the parent can attribute any following comment to
+                    # the next entry.
+                    if help_indent is not None and _indent_of(next_line) < help_indent:
                         break
-                    # If next line dedents past the help text, the help block is
-                    # over. Stop here without consuming the blank line so the
-                    # parent can attribute any following comment to the next entry
-                    # rather than this one.
-                    if help_indent is not None and next_stripped:
-                        next_indent = len(next_line) - len(next_stripped)
-                        if next_indent < help_indent:
-                            break
-
                 node.lines.append("")
-                self._advance()
+                self.pos += 1
                 continue
 
-            # Determine indentation from first help text line
+            indent = _indent_of(line)
             if help_indent is None:
-                # Count leading whitespace
-                if stripped:
-                    help_indent = len(line) - len(stripped)
+                if indent == 0:
+                    if _is_structural(stripped):
+                        break  # Empty help block
+                    raise ValueError(
+                        f"Line {self._line_number}: Help text must be indented. "
+                        f"The first line of help text has no indentation, making it "
+                        f"ambiguous where the help block ends."
+                    )
+                help_indent = indent
 
-                    # Validate that help text has proper indentation
-                    # Help text must be indented more than structural keywords (which are at column 0)
-                    # Exception: if the line is a structural keyword itself, it means the help block is empty
-                    # which is valid
-                    if help_indent == 0 and not self._is_structural_keyword(stripped):
-                        raise ValueError(
-                            f"Line {self.current_line_num}: Help text must be indented. "
-                            f"The first line of help text has no indentation, making it "
-                            f"ambiguous where the help block ends."
-                        )
-
-            # Check if this line is part of help text
-            if help_indent is not None:
-                current_indent = len(line) - len(stripped) if stripped else 0
-
-                # If line is indented at or past help indent level, it's help text
-                # (even if it looks like a structural keyword)
-                if stripped and current_indent >= help_indent:
-                    node.lines.append(stripped)
-                    self._advance()
-                # Empty line - could be paragraph break
-                elif not stripped:
-                    node.lines.append("")
-                    self._advance()
-                else:
-                    # Less indented than help text
-                    # Check if it's a structural keyword - if so, end help
-                    if self._is_structural_keyword(stripped):
-                        break
-                    # Otherwise, less indented non-keyword - also ends help block
-                    break
-            else:
-                # No help text found yet, but line has content - not help
+            # Anything at or past the help indent is help text, even keywords
+            if indent < help_indent:
                 break
+            node.lines.append(stripped)
+            self.help_lines.add(self._line_number)
+            self.pos += 1
 
-        # Consolidate consecutive empty lines in help text
-        consolidated_lines = []
-        prev_was_empty = False
-        for line in node.lines:
-            if not line:
-                if not prev_was_empty:
-                    consolidated_lines.append(line)
-                    prev_was_empty = True
-            else:
-                consolidated_lines.append(line)
-                prev_was_empty = False
-        node.lines = consolidated_lines
-
-        # Strip trailing empty lines
+        # Consolidate consecutive blank lines and strip trailing ones
+        node.lines = [
+            ln for i, ln in enumerate(node.lines) if ln or (i > 0 and node.lines[i - 1])
+        ]
         while node.lines and not node.lines[-1]:
             node.lines.pop()
-
         return node
 
     def _parse_choice(self) -> ChoiceEntry:
-        """Parse a choice block."""
-        line = self._current_line()
-        stripped = line.lstrip()
-
-        # Extract optional name
-        name = ""
-        if len(stripped) > 6 and stripped[6:].strip():
-            name = stripped[6:].strip()
-
-        node = ChoiceEntry(name=name, line_number=self.current_line_num)
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        node = ChoiceEntry(
+            name=_keyword_rest(code, "choice"),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
         self._advance()
 
-        # Parse until 'endchoice'
-        while self.pos < len(self.lines):
-            line = self._current_line()
-            stripped = line.lstrip()
+        # Comments attach to whatever follows them (an option or an entry), so
+        # a comment introducing a choice member stays above that member.
+        pending: list[ASTNode] = []
 
-            if stripped.startswith("endchoice"):
-                # Extract inline comment if present
-                _, comment = self._extract_inline_comment(line)
-                node.inline_comment = comment
+        def flush(target: list[ASTNode]):
+            target.extend(pending)
+            pending.clear()
+
+        while self.pos < len(self.raw):
+            stripped = self._current_line().lstrip()
+
+            if re.match(r"^endchoice\b", stripped):
+                node.end_comment = _split_comment(stripped)[1]
                 self._advance()
                 break
 
-            # Empty line
             if not stripped:
-                node.options.append(EmptyLine(line_number=self.current_line_num))
+                flush(node.entries if node.entries else node.options)
                 self._advance()
-                continue
-
-            # Config or menuconfig entry within choice
-            if stripped.startswith("config "):
-                node.entries.append(self._parse_config_entry())
-                continue
-
-            if stripped.startswith("menuconfig "):
-                node.entries.append(self._parse_menuconfig_entry())
-                continue
-
-            # Nested if block within choice
-            if stripped.startswith("if "):
-                node.entries.append(self._parse_if_block())
-                continue
-
-            if stripped.startswith(("source ", "rsource ", "osource ", "orsource ")):
-                node.entries.append(self._parse_source())
-                continue
-
-            # Comment
-            if stripped.startswith("#"):
-                text = stripped[1:].strip() if len(stripped) > 1 else ""
-                node.options.append(
-                    Comment(text=text, line_number=self.current_line_num)
-                )
-                self._advance()
-                continue
-
-            # Help block
-            if stripped.startswith("help"):
-                node.options.append(self._parse_help_block())
-                continue
-
-            # Choice option
-            option = self._parse_config_option()
-            if option:
-                node.options.append(option)
+            elif stripped.startswith("#"):
+                pending.append(self._comment_node(stripped))
+            elif _is_structural(stripped):
+                flush(node.entries)
+                node.entries.append(self._parse_statement())
             else:
-                node.options.append(
-                    UnknownLine(text=line, line_number=self.current_line_num)
-                )
-                self._advance()
+                flush(node.options)
+                node.options.append(self._parse_option_line())
 
+        flush(node.entries if node.entries else node.options)
         return node
 
     def _parse_menu(self) -> MenuEntry:
-        """Parse a menu block."""
-        line = self._current_line()
-        stripped = line.lstrip()
-
-        # Extract title (remove quotes if present)
-        title = stripped[5:].strip()
-        if title.startswith('"') and title.endswith('"'):
-            title = title[1:-1]
-
-        node = MenuEntry(title=title, line_number=self.current_line_num)
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        node = MenuEntry(
+            title=_unquote(_keyword_rest(code, "menu")),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
         self._advance()
 
-        # Parse until 'endmenu'
-        while self.pos < len(self.lines):
-            line = self._current_line()
-            stripped = line.lstrip()
+        while self.pos < len(self.raw):
+            stripped = self._current_line().lstrip()
 
-            if stripped.startswith("endmenu"):
-                # Extract inline comment if present
-                _, comment = self._extract_inline_comment(line)
-                node.inline_comment = comment
+            if re.match(r"^endmenu\b", stripped):
+                node.end_comment = _split_comment(stripped)[1]
                 self._advance()
                 break
 
-            if stripped.startswith(("depends on ", "visible if ")):
-                node.options.append(self._parse_config_option())
-            else:
-                # Otherwise parse as statement
-                stmt = self._parse_statement()
-                if stmt:
-                    node.statements.append(stmt)
+            # Menu attributes are only valid before the menu body
+            header = all(isinstance(s, EmptyLine) for s in node.statements)
+            if header and stripped.startswith(("depends on ", "visible if ")):
+                option = self._parse_config_option()
+                if option:
+                    node.options.append(option)
+                    continue
+            node.statements.append(self._parse_statement())
 
         return node
 
     def _parse_if_block(self) -> IfBlock:
-        """Parse an if/endif block."""
-        line = self._current_line()
-        stripped = line.lstrip()
-
-        condition = stripped[3:].strip()
-        node = IfBlock(condition=condition, line_number=self.current_line_num)
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        node = IfBlock(
+            condition=_keyword_rest(code, "if"),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
         self._advance()
 
-        # Parse until 'endif'
-        while self.pos < len(self.lines):
-            line = self._current_line()
-            stripped = line.lstrip()
-
-            if stripped.startswith("endif"):
-                # Extract inline comment if present
-                _, comment = self._extract_inline_comment(line)
-                node.inline_comment = comment
+        while self.pos < len(self.raw):
+            stripped = self._current_line().lstrip()
+            if re.match(r"^endif\b", stripped):
+                node.end_comment = _split_comment(stripped)[1]
                 self._advance()
                 break
-
-            stmt = self._parse_statement()
-            if stmt:
-                node.statements.append(stmt)
+            node.statements.append(self._parse_statement())
 
         return node
 
     def _parse_source(self) -> SourceStatement:
-        """Parse a source statement."""
-        line = self._current_line()
-        stripped = line.lstrip()
-
-        for src_type in ["orsource", "osource", "rsource", "source"]:
-            if stripped.startswith(src_type + " "):
-                path = stripped[len(src_type) :].strip()
-                if path.startswith('"') and path.endswith('"'):
-                    path = path[1:-1]
-                node = SourceStatement(
-                    source_type=src_type, path=path, line_number=self.current_line_num
-                )
-                self._advance()
-                return node
-
-        # Shouldn't reach here
-        self._advance()
-        return SourceStatement(
-            source_type="source", path="", line_number=self.current_line_num
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        source_type, path = (code.split(None, 1) + [""])[:2]
+        node = SourceStatement(
+            source_type=source_type,
+            path=_unquote(path.strip()),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
         )
+        self._advance()
+        return node
 
     def _parse_comment_statement(self) -> CommentStatement:
-        """Parse a 'comment' statement."""
-        line = self._current_line()
-        stripped = line.lstrip()
-
-        text = stripped[8:].strip()
-        if text.startswith('"') and text.endswith('"'):
-            text = text[1:-1]
-
-        node = CommentStatement(text=text, line_number=self.current_line_num)
+        code, inline_comment = _split_comment(self._current_line().lstrip())
+        node = CommentStatement(
+            text=_unquote(_keyword_rest(code, "comment")),
+            line_number=self._line_number,
+            inline_comment=inline_comment,
+        )
         self._advance()
 
-        # Check for depends on
-        while self.pos < len(self.lines):
+        while self.pos < len(self.raw):
             line = self._current_line()
             stripped = line.lstrip()
-
-            if not stripped or line[0] not in (" ", "\t"):
+            if not stripped or line[0] not in " \t":
                 break
-
-            if stripped.startswith("depends on "):
-                node.depends.append(stripped[11:].strip())
-                self._advance()
-            else:
+            if not stripped.startswith("depends on "):
                 break
+            node.depends.append(stripped[len("depends on ") :].strip())
+            self._advance()
 
         return node
 
@@ -973,467 +594,219 @@ class KconfigFormatter:
         self.lines: list[str] = []
 
     def format(self, ast: list[ASTNode]) -> list[str]:
-        """Format an AST into lines."""
+        """Format an AST into lines (without trailing newlines)."""
         self.lines = []
-        self._format_statements(ast, indent_level=0, in_config=False)
-
-        # Ensure file ends with newline
-        if self.lines and not self.lines[-1].endswith("\n"):
-            self.lines[-1] += "\n"
-
+        self._format_statements(ast, 0)
         return self.lines
 
-    def _get_indent(self, level: int, extra_level: int = 0) -> str:
-        """Get indentation string."""
-        total_level = level + extra_level
+    @property
+    def _unit(self) -> str:
+        return (
+            " " * self.config.primary_indent_spaces if self.config.use_spaces else "\t"
+        )
 
-        if self.config.use_spaces:
-            return " " * (total_level * self.config.primary_indent_spaces)
-        else:
-            return "\t" * total_level
+    def _get_indent(self, level: int, extra_level: int = 0) -> str:
+        return self._unit * (level + extra_level)
 
     def _get_help_indent(self, level: int) -> str:
-        """Get help text indentation."""
-        if self.config.use_spaces:
-            base = self.config.primary_indent_spaces
-            if self.config.indent_sub_items:
-                base += level * self.config.primary_indent_spaces
-            return " " * (base + self.config.help_indent_spaces)
-        else:
-            base_tabs = 1
-            if self.config.indent_sub_items:
-                base_tabs += level
-            return "\t" * base_tabs + " " * self.config.help_indent_spaces
+        return self._get_indent(level, 1) + " " * self.config.help_indent_spaces
+
+    def _sub_level(self, level: int) -> int:
+        return level + (1 if self.config.indent_sub_items else 0)
+
+    def _emit(self, code: str, inline_comment: str, indent: str):
+        """Append a line, wrapping long conditions with backslash continuations."""
+        comment = f"  {inline_comment}" if inline_comment else ""
+        if len(code + comment) <= self.config.max_line_length:
+            self.lines.append(code + comment)
+            return
+        wrapped = self._wrap_line(code, indent)
+        wrapped[-1] += comment
+        self.lines.extend(wrapped)
 
     def _wrap_line(self, line: str, base_indent: str) -> list[str]:
-        """Wrap a long line with continuation characters."""
-        # Strip newline if present
-        line = line.rstrip("\n")
-
-        # Calculate continuation indent (base indent + one level)
-        if self.config.use_spaces:
-            cont_indent = base_indent + " " * self.config.primary_indent_spaces
-        else:
-            cont_indent = base_indent + "\t"
-
-        # Split on && or ||
-        if "&&" in line:
-            separator = "&&"
-        elif "||" in line:
-            separator = "||"
-        else:
+        """Wrap a long line at '&&' or '||' (outside strings) with continuations."""
+        masked = _mask_quotes(line)
+        separator = "&&" if "&&" in masked else "||" if "||" in masked else None
+        if not separator:
             return [line]
 
-        # Find the prefix (everything before the first condition)
-        parts = line.split(separator)
-        if not parts:
-            return [line]
+        parts, start = [], 0
+        for m in re.finditer(re.escape(separator), masked):
+            parts.append(line[start : m.start()])
+            start = m.end()
+        parts.append(line[start:])
 
-        # Start with the prefix
-        result_lines = []
-        current_line = parts[0].rstrip()
-
-        for i, part in enumerate(parts[1:], 1):
+        cont_indent = base_indent + self._unit
+        result = []
+        current = parts[0].rstrip()
+        for part in parts[1:]:
             part = part.strip()
-            test_line = f"{current_line} {separator} {part}"
-
-            # If adding this part would exceed max length, wrap
-            if len(test_line) > self.config.max_line_length:
-                # End current line with backslash
-                result_lines.append(current_line + " \\")
-                # Start new line with continuation indent
-                current_line = f"{cont_indent}{separator} {part}"
+            candidate = f"{current} {separator} {part}"
+            if len(candidate) > self.config.max_line_length:
+                result.append(current + " \\")
+                current = f"{cont_indent}{separator} {part}"
             else:
-                current_line = test_line
+                current = candidate
+        result.append(current)
+        return result
 
-        # Add the last line
-        result_lines.append(current_line)
+    def _blank(self, prev_was_empty: bool):
+        if not (prev_was_empty and self.config.consolidate_empty_lines):
+            self.lines.append("")
 
-        return result_lines
+    def _format_node(self, node: ASTNode, level: int, in_config: bool = False):
+        if isinstance(node, Comment):
+            indent = self._get_indent(level, 1 if in_config else 0)
+            self.lines.append(f"{indent}# {node.text}" if node.text else f"{indent}#")
+        elif isinstance(node, UnknownLine):
+            text = node.text.strip()
+            self.lines.append(
+                f"{self._get_indent(level, 1)}{text}" if in_config else text
+            )
+        elif isinstance(node, EmptyLine):
+            self.lines.append("")
+        elif isinstance(node, ConfigOption):
+            self._format_config_option(node, level)
+        elif isinstance(node, HelpText):
+            self._format_help_text(node, level)
+        elif isinstance(node, ConfigEntry):
+            self._format_config_entry(node, level)
+        elif isinstance(node, ChoiceEntry):
+            self._format_choice(node, level)
+        elif isinstance(node, MenuEntry):
+            self._format_menu(node, level)
+        elif isinstance(node, IfBlock):
+            self._format_if_block(node, level)
+        elif isinstance(node, SourceStatement):
+            indent = self._get_indent(level)
+            self._emit(
+                f'{indent}{node.source_type} "{node.path}"', node.inline_comment, indent
+            )
+        elif isinstance(node, CommentStatement):
+            indent = self._get_indent(level)
+            self._emit(f'{indent}comment "{node.text}"', node.inline_comment, indent)
+            for dep in node.depends:
+                self.lines.append(f"{self._get_indent(level, 1)}depends on {dep}")
 
-    def _append_inline_comment(self, line: str, inline_comment: str) -> str:
-        """Append inline comment to a line if present.
-
-        Args:
-            line: The line to append to
-            inline_comment: The inline comment (with # prefix)
-
-        Returns:
-            Line with inline comment appended with proper spacing
-        """
-        if not inline_comment:
-            return line
-
-        # Ensure there are 2 spaces before the comment
-        return f"{line}  {inline_comment}"
-
-    def _format_statements(
-        self, statements: list[ASTNode], indent_level: int, in_config: bool
-    ):
-        """Format a list of statements."""
+    def _format_statements(self, statements: list[ASTNode], level: int):
         prev_was_empty = False
-        prev_stmt_type = None
-
-        for i, stmt in enumerate(statements):
-            # Handle empty line consolidation
+        prev = None
+        for stmt in statements:
             if isinstance(stmt, EmptyLine):
-                if self.config.consolidate_empty_lines:
-                    if not prev_was_empty:
-                        self.lines.append("")
-                        prev_was_empty = True
-                else:
-                    self.lines.append("")
-                    prev_was_empty = True
+                self._blank(prev_was_empty)
+                prev_was_empty = True
                 continue
-
-            # Insert blank line before certain statement types if not already present
-            if not prev_was_empty and prev_stmt_type is not None:
-                if self._should_insert_blank_line(prev_stmt_type, type(stmt).__name__):
-                    self.lines.append("")
-
+            # Always separate blocks from each other
+            if (
+                not prev_was_empty
+                and isinstance(prev, BLOCK_TYPES)
+                and isinstance(stmt, BLOCK_TYPES)
+            ):
+                self.lines.append("")
             prev_was_empty = False
-            prev_stmt_type = type(stmt).__name__
+            prev = stmt
+            self._format_node(stmt, level)
 
-            if isinstance(stmt, Comment):
-                self._format_comment(stmt, indent_level, in_config)
-            elif isinstance(stmt, ConfigEntry):
-                self._format_config_entry(stmt, indent_level)
-            elif isinstance(stmt, ChoiceEntry):
-                self._format_choice(stmt, indent_level)
-            elif isinstance(stmt, MenuEntry):
-                self._format_menu(stmt, indent_level)
-            elif isinstance(stmt, IfBlock):
-                self._format_if_block(stmt, indent_level)
-            elif isinstance(stmt, SourceStatement):
-                self._format_source(stmt, indent_level)
-            elif isinstance(stmt, CommentStatement):
-                self._format_comment_statement(stmt, indent_level)
-            elif isinstance(stmt, UnknownLine):
-                self._format_unknown_line(stmt, indent_level, in_config)
+    def _format_end(self, keyword: str, level: int, comment: str, has_body: bool):
+        if has_body and self.lines and self.lines[-1] != "":
+            self.lines.append("")
+        line = f"{self._get_indent(level)}{keyword}"
+        self.lines.append(f"{line}  {comment}" if comment else line)
 
-    def _should_insert_blank_line(self, prev_type: str, current_type: str) -> bool:
-        """Determine if a blank line should be inserted between two statement types.
+    def _format_config_entry(self, node: ConfigEntry, level: int):
+        indent = self._get_indent(level)
+        self._emit(
+            f"{indent}{node.config_type} {node.name}", node.inline_comment, indent
+        )
 
-        Args:
-            prev_type: The type name of the previous statement
-            current_type: The type name of the current statement
-
-        Returns:
-            True if a blank line should be inserted
-        """
-        # Statement types that should be separated by blank lines
-        block_types = {
-            "ConfigEntry",
-            "ChoiceEntry",
-            "MenuEntry",
-            "IfBlock",
-            "CommentStatement",
-        }
-
-        # Always separate blocks from each other
-        if prev_type in block_types and current_type in block_types:
-            return True
-
-        return False
-
-    def _format_comment(self, node: Comment, indent_level: int, in_config: bool):
-        """Format a comment line."""
-        indent = self._get_indent(indent_level, 1 if in_config else 0)
-
-        # Ensure space after #
-        if node.text:
-            self.lines.append(f"{indent}# {node.text}")
-        else:
-            self.lines.append(f"{indent}#")
-
-    def _format_config_entry(self, node: ConfigEntry, indent_level: int):
-        """Format a config, configdefault or menuconfig entry."""
-        indent = self._get_indent(indent_level)
-        line = f"{indent}{node.config_type} {node.name}"
-        line = self._append_inline_comment(line, node.inline_comment)
-        self.lines.append(line)
-
-        # Format options with empty line consolidation
         prev_was_empty = False
         for option in node.options:
             if isinstance(option, EmptyLine):
-                if self.config.consolidate_empty_lines:
-                    if not prev_was_empty:
-                        self.lines.append("")
-                        prev_was_empty = True
-                else:
-                    self.lines.append("")
-                    prev_was_empty = True
+                self._blank(prev_was_empty)
+                prev_was_empty = True
             else:
                 prev_was_empty = False
-                if isinstance(option, Comment):
-                    self._format_comment(option, indent_level, in_config=True)
-                elif isinstance(option, HelpText):
-                    self._format_help_text(option, indent_level)
-                elif isinstance(option, ConfigOption):
-                    self._format_config_option(option, indent_level)
-                elif isinstance(option, UnknownLine):
-                    self._format_unknown_line(option, indent_level, in_config=True)
+                self._format_node(option, level, in_config=True)
 
-    def _format_config_option(self, node: ConfigOption, indent_level: int):
-        """Format a config option."""
-        indent = self._get_indent(indent_level, 1)
-
-        # Build the line
-        if node.option_type in ["bool", "tristate", "string", "int", "hex"]:
-            if node.value:
-                line = f"{indent}{node.option_type} {node.value}"
-            else:
-                line = f"{indent}{node.option_type}"
-        elif node.option_type.startswith("def_"):
-            line = f"{indent}{node.option_type} {node.value}"
-        else:
-            line = f"{indent}{node.option_type.replace('_', ' ')} {node.value}"
-
+    def _format_config_option(self, node: ConfigOption, level: int):
+        indent = self._get_indent(level, 1)
+        keyword = (
+            node.option_type
+            if node.option_type.startswith("def_")
+            else node.option_type.replace("_", " ")
+        )
+        line = f"{indent}{keyword}"
+        if node.value:
+            line += f" {node.value}"
         if node.condition:
             line += f" if {node.condition}"
+        self._emit(line, node.inline_comment, indent)
 
-        # Append inline comment before checking length
-        line = self._append_inline_comment(line, node.inline_comment)
-
-        # Check if line is too long and needs wrapping
-        if len(line) > self.config.max_line_length and ("&&" in line or "||" in line):
-            wrapped_lines = self._wrap_line(line, indent)
-            self.lines.extend(wrapped_lines)
-        else:
-            self.lines.append(line)
-
-    def _format_help_text(self, node: HelpText, indent_level: int):
-        """Format help text block."""
-        indent = self._get_indent(indent_level, 1)
-        self.lines.append(f"{indent}help")
-
-        help_indent = self._get_help_indent(indent_level)
-
+    def _format_help_text(self, node: HelpText, level: int):
+        self.lines.append(f"{self._get_indent(level, 1)}help")
+        help_indent = self._get_help_indent(level)
         if self.config.reflow_help_text:
-            # Reflow help text
-            lines = self._reflow_help_text(node.lines, help_indent)
-            self.lines.extend(lines)
+            self.lines.extend(self._reflow_help_text(node.lines, help_indent))
         else:
-            # Just apply indentation, consolidating consecutive blank lines
-            prev_was_empty = False
-            for line in node.lines:
-                if line:
-                    self.lines.append(f"{help_indent}{line}")
-                    prev_was_empty = False
-                else:
-                    if not prev_was_empty:
-                        self.lines.append("")
-                        prev_was_empty = True
+            self.lines.extend(f"{help_indent}{ln}" if ln else "" for ln in node.lines)
 
     def _reflow_help_text(self, text_lines: list[str], indent: str) -> list[str]:
-        """Reflow help text to fit max line length."""
-        # Calculate available width
+        """Reflow help text paragraphs to fit max line length."""
         indent_width = len(indent.replace("\t", " " * 4))
         available_width = self.config.max_line_length - indent_width
-
         if available_width < 20:
             available_width = 40
 
         result = []
-
-        # Split into paragraphs, consolidating consecutive blank lines
-        paragraphs = []
-        current_para = []
-        prev_was_empty = False
-
-        for line in text_lines:
-            if not line:
-                if current_para:
-                    paragraphs.append(current_para)
-                    current_para = []
-                # Only add one empty paragraph for consecutive blank lines
-                if not prev_was_empty:
-                    paragraphs.append([])  # Empty paragraph
-                    prev_was_empty = True
-            else:
-                current_para.append(line)
-                prev_was_empty = False
-
-        if current_para:
-            paragraphs.append(current_para)
-
-        # Reflow each paragraph using textwrap
-        for para in paragraphs:
-            if not para:
+        # Parser guarantees no consecutive/trailing blanks, so blanks split paragraphs
+        for para in "\n".join(text_lines).split("\n\n"):
+            if result:
                 result.append("")
-                continue
-
-            # Join paragraph into single text
-            text = " ".join(para)
-
-            if not text.strip():
-                continue
-
-            # Use textwrap.fill() to reflow the text
-            wrapped = textwrap.fill(
-                text,
+            wrapped = textwrap.wrap(
+                " ".join(para.split("\n")),
                 width=available_width,
-                initial_indent="",
-                subsequent_indent="",
                 break_long_words=False,
                 break_on_hyphens=False,
             )
-
-            # Add indent to each line
-            for line in wrapped.split("\n"):
-                result.append(f"{indent}{line}")
-
+            result.extend(f"{indent}{ln}" for ln in wrapped)
         return result
 
-    def _format_choice(self, node: ChoiceEntry, indent_level: int):
-        """Format a choice block."""
-        indent = self._get_indent(indent_level)
+    def _format_choice(self, node: ChoiceEntry, level: int):
+        indent = self._get_indent(level)
+        header = f"{indent}choice {node.name}" if node.name else f"{indent}choice"
+        self._emit(header, node.inline_comment, indent)
 
-        if node.name:
-            self.lines.append(f"{indent}choice {node.name}")
-        else:
-            self.lines.append(f"{indent}choice")
-
-        # Format options
+        # Blank lines in the choice header are normalized away
         for option in node.options:
-            if isinstance(option, EmptyLine):
-                # Skip empty lines in choice options - we'll add proper spacing
-                continue
-            elif isinstance(option, Comment):
-                self._format_comment(option, indent_level, in_config=True)
-            elif isinstance(option, HelpText):
-                self._format_help_text(option, indent_level)
-            elif isinstance(option, ConfigOption):
-                self._format_config_option(option, indent_level)
-            elif isinstance(option, UnknownLine):
-                self._format_unknown_line(option, indent_level, in_config=True)
+            if not isinstance(option, EmptyLine):
+                self._format_node(option, level, in_config=True)
 
-        # Format entries (config, menuconfig, if blocks, etc.)
-        # Check if there are any non-empty-line options before entries
-        has_real_options = any(not isinstance(opt, EmptyLine) for opt in node.options)
-
+        has_options = any(not isinstance(o, EmptyLine) for o in node.options)
+        sub_level = self._sub_level(level)
+        prev = None
         for i, entry in enumerate(node.entries):
-            # Add blank line before entries
-            # - Always before the first one if there are real options
-            # - Before subsequent ones (except for nested if blocks)
-            if i > 0 or has_real_options:
+            # Blank line before each entry, except directly after its comment
+            if (i > 0 or has_options) and not isinstance(prev, Comment):
                 self.lines.append("")
+            self._format_node(entry, sub_level)
+            prev = entry
 
-            # Format based on entry type
-            next_level = indent_level + (1 if self.config.indent_sub_items else 0)
-            if isinstance(entry, ConfigEntry):
-                self._format_config_entry(entry, next_level)
-            elif isinstance(entry, IfBlock):
-                self._format_if_block(entry, next_level)
-            elif isinstance(entry, MenuEntry):
-                self._format_menu(entry, next_level)
-            elif isinstance(entry, ChoiceEntry):
-                self._format_choice(entry, next_level)
-            elif isinstance(entry, SourceStatement):
-                self._format_source(entry, next_level)
-            elif isinstance(entry, CommentStatement):
-                self._format_comment_statement(entry, next_level)
-            elif isinstance(entry, Comment):
-                self._format_comment(entry, next_level, in_config=False)
-            elif isinstance(entry, EmptyLine):
-                self.lines.append("")
-            elif isinstance(entry, UnknownLine):
-                self._format_unknown_line(entry, next_level, in_config=False)
+        self._format_end("endchoice", level, node.end_comment, bool(node.entries))
 
-        # Add blank line before endchoice if there are entries
-        if node.entries and self.lines and self.lines[-1] != "":
-            self.lines.append("")
-
-        # Format endchoice with inline comment
-        if self.config.indent_sub_items:
-            endchoice_line = f"{self._get_indent(indent_level, 1)}endchoice"
-        else:
-            endchoice_line = f"{indent}endchoice"
-        endchoice_line = self._append_inline_comment(
-            endchoice_line, node.inline_comment
-        )
-        self.lines.append(endchoice_line)
-
-    def _format_menu(self, node: MenuEntry, indent_level: int):
-        """Format a menu block."""
-        indent = self._get_indent(indent_level)
-        self.lines.append(f'{indent}menu "{node.title}"')
-
-        # Depends
+    def _format_menu(self, node: MenuEntry, level: int):
+        indent = self._get_indent(level)
+        self._emit(f'{indent}menu "{node.title}"', node.inline_comment, indent)
         for option in node.options:
-            self._format_config_option(option, indent_level)
+            self._format_config_option(option, level)
+        self._format_statements(node.statements, self._sub_level(level))
+        self._format_end("endmenu", level, node.end_comment, bool(node.statements))
 
-        # Statements
-        next_level = indent_level + (1 if self.config.indent_sub_items else 0)
-        self._format_statements(node.statements, next_level, in_config=False)
-
-        # Add blank line before endmenu if there are statements
-        if node.statements and self.lines and self.lines[-1] != "":
-            self.lines.append("")
-
-        if self.config.indent_sub_items:
-            endmenu_line = f"{self._get_indent(indent_level)}endmenu"
-        else:
-            endmenu_line = f"{indent}endmenu"
-        endmenu_line = self._append_inline_comment(endmenu_line, node.inline_comment)
-        self.lines.append(endmenu_line)
-
-    def _format_if_block(self, node: IfBlock, indent_level: int):
-        """Format an if/endif block."""
-        indent = self._get_indent(indent_level)
-        line = f"{indent}if {node.condition}"
-
-        # Check if line needs wrapping
-        if len(line) > self.config.max_line_length and ("&&" in line or "||" in line):
-            wrapped_lines = self._wrap_line(line, indent)
-            self.lines.extend(wrapped_lines)
-        else:
-            self.lines.append(line)
-
-        next_level = indent_level + (1 if self.config.indent_sub_items else 0)
-        self._format_statements(node.statements, next_level, in_config=False)
-
-        # Add blank line before endif if there are statements
-        if node.statements and self.lines and self.lines[-1] != "":
-            self.lines.append("")
-
-        # Format endif with optional inline comment
-        endif_indent = (
-            self._get_indent(indent_level) if self.config.indent_sub_items else indent
-        )
-        endif_line = f"{endif_indent}endif"
-        endif_line = self._append_inline_comment(endif_line, node.inline_comment)
-        self.lines.append(endif_line)
-
-    def _format_source(self, node: SourceStatement, indent_level: int):
-        """Format a source statement."""
-        indent = self._get_indent(indent_level)
-        self.lines.append(f'{indent}{node.source_type} "{node.path}"')
-
-    def _format_comment_statement(self, node: CommentStatement, indent_level: int):
-        """Format a comment statement."""
-        indent = self._get_indent(indent_level)
-        self.lines.append(f'{indent}comment "{node.text}"')
-
-        option_indent = self._get_indent(indent_level, 1)
-        for dep in node.depends:
-            self.lines.append(f"{option_indent}depends on {dep}")
-
-    def _format_unknown_line(
-        self, node: UnknownLine, indent_level: int, in_config: bool
-    ):
-        """Format an unknown line - preserve original indentation or apply config indent."""
-        # Get original line without newline and strip existing indentation
-        text = node.text.rstrip("\n\r").lstrip()
-
-        # If we're in a config, indent it like an option
-        if in_config and text:
-            indent = self._get_indent(indent_level, 1)
-            self.lines.append(f"{indent}{text}")
-        else:
-            # At top level, preserve stripped content
-            self.lines.append(text)
+    def _format_if_block(self, node: IfBlock, level: int):
+        indent = self._get_indent(level)
+        self._emit(f"{indent}if {node.condition}", node.inline_comment, indent)
+        self._format_statements(node.statements, self._sub_level(level))
+        self._format_end("endif", level, node.end_comment, bool(node.statements))
 
 
 class KconfigLinter:
@@ -1445,400 +818,202 @@ class KconfigLinter:
         self.parser = KconfigParser()
         self.formatter = KconfigFormatter(config)
 
+    def _issue(self, line: int, col: int | None, severity: str, message: str):
+        self.issues.append(LintIssue(line, col, severity, message))
+
     def lint_file(self, filepath: Path) -> list[LintIssue]:
         """Lint a Kconfig file and return list of issues."""
         self.issues = []
-
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-                lines = content.splitlines(keepends=True)
+            content = Path(filepath).read_text(encoding="utf-8")
         except Exception as e:
-            self.issues.append(LintIssue(0, None, "error", f"Failed to read file: {e}"))
+            self._issue(0, None, "error", f"Failed to read file: {e}")
             return self.issues
 
-        # Check each line for basic issues
+        lines = content.splitlines()
+        try:
+            ast = self.parser.parse(content)
+        except ValueError as e:
+            self._issue(0, None, "error", f"Failed to parse file: {e}")
+            return self.issues
+
+        self._lint_lines(lines, self.parser.help_lines)
+        self._lint_ast(ast)
+        self._lint_formatting(lines, ast)
+        return self.issues
+
+    def _lint_lines(self, lines: list[str], help_lines: set[int]):
+        """Line-level checks that give a specific reason for a style violation."""
+        cfg = self.config
+        help_prefix = re.compile(rf"^\t+ {{{cfg.help_indent_spaces}}}")
         empty_line_count = 0
+
         for i, line in enumerate(lines, 1):
-            line_no_newline = line.rstrip("\n\r")
+            stripped = line.strip()
 
-            # Trailing whitespace
-            if line_no_newline != line_no_newline.rstrip():
-                self.issues.append(
-                    LintIssue(
-                        i,
-                        len(line_no_newline.rstrip()) + 1,
-                        "error",
-                        "Trailing whitespace not allowed",
-                    )
+            if line != line.rstrip():
+                self._issue(
+                    i,
+                    len(line.rstrip()) + 1,
+                    "error",
+                    "Trailing whitespace not allowed",
                 )
 
-            # Line length
-            if len(line_no_newline) > self.config.max_line_length:
-                self.issues.append(
-                    LintIssue(
-                        i,
-                        self.config.max_line_length + 1,
-                        "error",
-                        f"Line exceeds {self.config.max_line_length} characters",
-                    )
+            if len(line) > cfg.max_line_length:
+                self._issue(
+                    i,
+                    cfg.max_line_length + 1,
+                    "error",
+                    f"Line exceeds {cfg.max_line_length} characters",
                 )
 
-            # Multiple consecutive empty lines
-            if not line.strip():
+            if not stripped:
                 empty_line_count += 1
-                if self.config.consolidate_empty_lines and empty_line_count > 1:
-                    self.issues.append(
-                        LintIssue(
-                            i,
-                            1,
-                            "warning",
-                            "Multiple consecutive empty lines (should be consolidated to one)",
-                        )
-                    )
-            else:
-                empty_line_count = 0
-
-            # Comment spacing
-            stripped = line_no_newline.lstrip()
-            if stripped.startswith("#") and len(stripped) > 1 and stripped[1] != " ":
-                indent_len = len(line_no_newline) - len(stripped)
-                self.issues.append(
-                    LintIssue(
+                if cfg.consolidate_empty_lines and empty_line_count > 1:
+                    self._issue(
                         i,
-                        indent_len + 2,
+                        1,
                         "warning",
-                        'Comments should have a space after # (use "# Comment" not "#Comment")',
+                        "Multiple consecutive empty lines (should be consolidated to one)",
                     )
-                )
-
-        # Check indentation issues (pass 2 - needs context)
-        in_help_block = False
-        for i, line in enumerate(lines, 1):
-            line_no_newline = line.rstrip("\n\r")
-            if not line_no_newline.strip():
                 continue
+            empty_line_count = 0
 
-            stripped = line_no_newline.lstrip()
-            indent = line_no_newline[: len(line_no_newline) - len(stripped)]
-
-            # Track help blocks for special indentation handling
-            if stripped.startswith("help"):
-                in_help_block = True
-                continue
-            elif in_help_block:
-                # Check if we're still in help text
-                # Help text can have tab + spaces (that's the expected format)
-                if stripped.startswith(
-                    (
-                        "#",
-                        "config",
-                        "menuconfig",
-                        "choice",
-                        "menu",
-                        "if ",
-                        "endif",
-                        "endmenu",
-                        "endchoice",
-                        "source",
-                        "rsource",
-                        "comment ",
-                        "mainmenu",
-                    )
-                ):
-                    # We've hit a keyword, exit help block
-                    in_help_block = False
-                else:
-                    # Still in help text - validate help text indentation
-                    if not self.config.use_spaces and stripped:
-                        # This is help text content - should be tab + spaces
-                        expected_prefix = "\t" + " " * self.config.help_indent_spaces
-                        if not line_no_newline.startswith(expected_prefix):
-                            # Check if it's just a tab (wrong)
-                            if line_no_newline.startswith(
-                                "\t"
-                            ) and not line_no_newline.startswith(expected_prefix):
-                                self.issues.append(
-                                    LintIssue(
-                                        i,
-                                        1,
-                                        "error",
-                                        f"Help text should be indented with tab + {self.config.help_indent_spaces} spaces",
-                                    )
-                                )
-                    continue
-
-            # Check for mixed tabs and spaces (but not in help text)
-            if "\t" in indent and " " in indent:
-                self.issues.append(
-                    LintIssue(
+            if i in help_lines:
+                if not cfg.use_spaces and not help_prefix.match(line):
+                    self._issue(
                         i,
                         1,
                         "error",
-                        "Mixed tabs and spaces in indentation",
+                        f"Help text should be indented with tab + {cfg.help_indent_spaces} spaces",
                     )
+                continue
+
+            if stripped.startswith("#") and len(stripped) > 1 and stripped[1] != " ":
+                self._issue(
+                    i,
+                    _indent_of(line) + 2,
+                    "warning",
+                    'Comments should have a space after # (use "# Comment" not "#Comment")',
                 )
 
-            # Check tabs vs spaces based on config
-            if indent:
-                if self.config.use_spaces:
-                    if "\t" in indent:
-                        self.issues.append(
-                            LintIssue(
-                                i,
-                                1,
-                                "error",
-                                "Use spaces for indentation (tabs not allowed)",
-                            )
-                        )
-                    # Check if indentation is multiple of configured spaces
-                    elif len(indent) % self.config.primary_indent_spaces != 0:
-                        self.issues.append(
-                            LintIssue(
-                                i,
-                                1,
-                                "error",
-                                f"Indentation should be a multiple of {self.config.primary_indent_spaces} spaces",
-                            )
-                        )
-                else:
-                    # Using tabs
-                    if " " in indent:
-                        self.issues.append(
-                            LintIssue(
-                                i,
-                                1,
-                                "error",
-                                "Use tabs for indentation (spaces not allowed except in help text)",
-                            )
-                        )
+            indent = line[: _indent_of(line)]
+            if not indent:
+                continue
+            if "\t" in indent and " " in indent:
+                self._issue(i, 1, "error", "Mixed tabs and spaces in indentation")
+            if cfg.use_spaces:
+                if "\t" in indent:
+                    self._issue(
+                        i, 1, "error", "Use spaces for indentation (tabs not allowed)"
+                    )
+                elif len(indent) % cfg.primary_indent_spaces != 0:
+                    self._issue(
+                        i,
+                        1,
+                        "error",
+                        f"Indentation should be a multiple of {cfg.primary_indent_spaces} spaces",
+                    )
+            elif " " in indent:
+                self._issue(
+                    i,
+                    1,
+                    "error",
+                    "Use tabs for indentation (spaces not allowed except in help text)",
+                )
 
-        # Parse and check AST-level rules
-        ast = self.parser.parse(content)
-        self._lint_ast(ast, filepath)
+    def _lint_formatting(self, lines: list[str], ast: list[ASTNode]):
+        """Flag anything the formatter would change that wasn't already reported.
 
-        return self.issues
+        Keeps lint and --write in agreement.
+        """
+        formatted = self.formatter.format(ast)
+        flagged = {issue.line_number for issue in self.issues}
+        matcher = difflib.SequenceMatcher(None, lines, formatted, autojunk=False)
+        for tag, i1, i2, _, _ in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            span = range(i1 + 1, max(i2, i1 + 1) + 1)
+            if flagged.intersection(span):
+                continue
+            self._issue(
+                min(i1 + 1, max(len(lines), 1)),
+                None,
+                "warning",
+                "Formatting differs from style (run with --write to fix)",
+            )
 
-    def _lint_ast(self, nodes: list[ASTNode], filepath: Path):
+    def _lint_ast(self, nodes: list[ASTNode]):
         """Lint AST nodes for structural issues."""
         for node in nodes:
             if isinstance(node, ConfigEntry):
                 self._lint_config_entry(node)
-            elif isinstance(node, ChoiceEntry):
-                self._lint_choice(node)
-            elif isinstance(node, MenuEntry):
-                self._lint_menu(node)
-            elif isinstance(node, IfBlock):
-                self._lint_if_block(node)
+            children = getattr(node, "statements", None) or getattr(node, "entries", [])
+            self._lint_ast(children)
 
     def _lint_config_entry(self, node: ConfigEntry):
-        """Lint a config entry."""
-        # Check config name
-        if len(node.name) > self.config.max_option_name_length:
-            self.issues.append(
-                LintIssue(
+        cfg = self.config
+        col = len(node.config_type) + 2
+
+        if len(node.name) > cfg.max_option_name_length:
+            self._issue(
+                node.line_number,
+                col,
+                "error",
+                f"Config name exceeds {cfg.max_option_name_length} characters",
+            )
+
+        if cfg.enforce_uppercase_configs and node.name != node.name.upper():
+            self._issue(
+                node.line_number, col, "error", "Config option name must be uppercase"
+            )
+
+        if cfg.min_prefix_length > 0 and "_" in node.name:
+            if len(node.name.split("_")[0]) < cfg.min_prefix_length:
+                self._issue(
                     node.line_number,
-                    len(node.config_type) + 2,
-                    "error",
-                    f"Config name exceeds {self.config.max_option_name_length} characters",
-                )
-            )
-
-        # Check uppercase if configured
-        if self.config.enforce_uppercase_configs:
-            if node.name != node.name.upper():
-                self.issues.append(
-                    LintIssue(
-                        node.line_number,
-                        len(node.config_type) + 2,
-                        "error",
-                        "Config option name must be uppercase",
-                    )
-                )
-
-        # Check prefix length
-        if self.config.min_prefix_length > 0 and "_" in node.name:
-            prefix = node.name.split("_")[0]
-            if len(prefix) < self.config.min_prefix_length:
-                self.issues.append(
-                    LintIssue(
-                        node.line_number,
-                        len(node.config_type) + 2,
-                        "warning",
-                        f"Config prefix should be at least {self.config.min_prefix_length} characters",
-                    )
-                )
-
-    def _lint_choice(self, node: ChoiceEntry):
-        """Lint a choice block."""
-        self._lint_ast(node.entries, None)
-
-    def _lint_menu(self, node: MenuEntry):
-        """Lint a menu block."""
-        self._lint_ast(node.statements, None)
-
-    def _lint_if_block(self, node: IfBlock):
-        """Lint an if block."""
-        self._lint_ast(node.statements, None)
-
-    # Compatibility methods for tests
-    def _get_line_type(self, line: str) -> str:
-        """Determine the type of Kconfig line (for test compatibility)."""
-        stripped = line.lstrip()
-
-        if stripped.startswith("#"):
-            return "comment_line"
-        elif stripped.startswith("config "):
-            return "config"
-        elif stripped.startswith("configdefault "):
-            return "configdefault"
-        elif stripped.startswith("menuconfig "):
-            return "menuconfig"
-        elif stripped.startswith("menu "):
-            return "menu"
-        elif stripped.startswith("endmenu"):
-            return "endmenu"
-        elif stripped.startswith("choice"):
-            return "choice"
-        elif stripped.startswith("endchoice"):
-            return "endchoice"
-        elif stripped.startswith("if "):
-            return "if"
-        elif stripped.startswith("endif"):
-            return "endif"
-        elif stripped.startswith(("source ", "rsource ")):
-            return "source"
-        elif stripped.startswith("comment "):
-            return "comment"
-        elif stripped.startswith("help"):
-            return "help"
-        elif re.match(
-            r"^\s*(bool|tristate|string|int|hex|def_bool|def_tristate|def_int|def_hex|def_string|prompt|default|depends on|visible if|select|imply|range|option)\s",
-            stripped,
-        ):
-            return "option"
-        else:
-            return "other"
-
-    def _check_config_name(self, line: str, line_num: int):
-        """Check config/configdefault/menuconfig name formatting (for test compatibility)."""
-        match = re.match(r"^\s*(config|configdefault|menuconfig)\s+(\S+)", line)
-        if not match:
-            return
-
-        config_name = match.group(2)
-
-        if len(config_name) > self.config.max_option_name_length:
-            self.issues.append(
-                LintIssue(
-                    line_num,
-                    match.start(2) + 1,
-                    "error",
-                    f"Config name exceeds {self.config.max_option_name_length} characters",
-                )
-            )
-
-        if self.config.enforce_uppercase_configs:
-            if config_name != config_name.upper():
-                self.issues.append(
-                    LintIssue(
-                        line_num,
-                        match.start(2) + 1,
-                        "error",
-                        "Config option name must be uppercase",
-                    )
-                )
-
-        if self.config.min_prefix_length > 0 and "_" in config_name:
-            prefix = config_name.split("_")[0]
-            if len(prefix) < self.config.min_prefix_length:
-                self.issues.append(
-                    LintIssue(
-                        line_num,
-                        match.start(2) + 1,
-                        "warning",
-                        f"Config prefix should be at least {self.config.min_prefix_length} characters",
-                    )
+                    col,
+                    "warning",
+                    f"Config prefix should be at least {cfg.min_prefix_length} characters",
                 )
 
     def format_file(self, filepath: Path) -> tuple[list[str], list[LintIssue]]:
-        """Format a Kconfig file and return the formatted lines."""
+        """Format a Kconfig file. On failure, lines is empty and issues explain why."""
         self.issues = []
-
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
+            content = Path(filepath).read_text(encoding="utf-8")
+            ast = self.parser.parse(content)
         except Exception as e:
-            self.issues.append(LintIssue(0, None, "error", f"Failed to read file: {e}"))
+            self._issue(0, None, "error", f"Failed to read file: {e}")
             return [], self.issues
 
-        ast = self.parser.parse(content)
-        formatted_lines = self.formatter.format(ast)
-
-        # Add newlines
-        result = [
-            line + "\n" if not line.endswith("\n") else line for line in formatted_lines
-        ]
-
-        return result, self.issues
+        return [line + "\n" for line in self.formatter.format(ast)], self.issues
 
 
 def _dump_ast(nodes: list[ASTNode], indent: int = 0):
     """Dump AST structure for debugging."""
-    prefix = "  " * indent
-
+    pad = "  " * indent
     for node in nodes:
-        if isinstance(node, EmptyLine):
-            print(f"{prefix}EmptyLine")
-        elif isinstance(node, Comment):
-            print(f"{prefix}Comment: {node.text!r}")
-        elif isinstance(node, ConfigEntry):
-            print(f"{prefix}ConfigEntry: {node.config_type} {node.name}")
-            if node.options:
-                print(f"{prefix}  options:")
-                _dump_ast(node.options, indent + 2)
-        elif isinstance(node, ConfigOption):
-            cond_str = f" if {node.condition}" if node.condition else ""
-            print(f"{prefix}ConfigOption: {node.option_type} {node.value!r}{cond_str}")
-        elif isinstance(node, HelpText):
-            print(f"{prefix}HelpText: {len(node.lines)} line(s)")
-            for line in node.lines:
-                print(f"{prefix}  {line!r}")
-        elif isinstance(node, ChoiceEntry):
-            name_str = f" ({node.name})" if node.name else ""
-            print(f"{prefix}ChoiceEntry{name_str}")
-            if node.options:
-                print(f"{prefix}  options:")
-                _dump_ast(node.options, indent + 2)
-            if node.entries:
-                print(f"{prefix}  entries:")
-                _dump_ast(node.entries, indent + 2)
-        elif isinstance(node, MenuEntry):
-            print(f"{prefix}MenuEntry: {node.title!r}")
-            for n in node.options:
-                print(f"{prefix}  {n.option_type.replace('_', ' ')}: {n.value}")
-            if node.statements:
-                print(f"{prefix}  statements:")
-                _dump_ast(node.statements, indent + 2)
-        elif isinstance(node, IfBlock):
-            print(f"{prefix}IfBlock: {node.condition}")
-            if node.statements:
-                print(f"{prefix}  statements:")
-                _dump_ast(node.statements, indent + 2)
-        elif isinstance(node, SourceStatement):
-            print(f"{prefix}SourceStatement: {node.source_type} {node.path!r}")
-        elif isinstance(node, CommentStatement):
-            print(f"{prefix}CommentStatement: {node.text!r}")
-            if node.depends:
-                print(f"{prefix}  depends: {node.depends}")
-        elif isinstance(node, UnknownLine):
-            print(f"{prefix}UnknownLine: {node.text!r}")
-        else:
-            print(f"{prefix}{type(node).__name__}")
+        attrs = []
+        children = []
+        for f in fields(node):
+            value = getattr(node, f.name)
+            if isinstance(value, list):
+                if value:
+                    children.append((f.name, value))
+            elif f.name != "line_number" and value != "":
+                attrs.append(f"{f.name}={value!r}")
+        print(f"{pad}{type(node).__name__}({', '.join(attrs)})")
+        for name, items in children:
+            print(f"{pad}  {name}:")
+            if all(isinstance(item, ASTNode) for item in items):
+                _dump_ast(items, indent + 2)
+            else:
+                for item in items:
+                    print(f"{pad}    {item!r}")
 
 
-def main():
-    """Main entry point for the linter."""
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Lint and format Kconfig files for style compliance",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1858,207 +1033,171 @@ Examples:
   kconfigstyle --use-spaces --max-line-length 120 --write Kconfig
         """,
     )
-
-    parser.add_argument(
-        "files", nargs="+", type=Path, help="Kconfig files to lint/format"
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-    )
-    parser.add_argument(
+    add = parser.add_argument
+    add("files", nargs="+", type=Path, help="Kconfig files to lint/format")
+    add("--version", action="version", version=f"%(prog)s {__version__}")
+    add(
         "--preset",
         choices=["zephyr", "espidf"],
+        default="zephyr",
         help="Use a style preset (individual options override preset values)",
     )
-    parser.add_argument(
+    add(
         "--write",
         "-w",
         action="store_true",
         help="Write formatted output back to files (format mode)",
     )
-    parser.add_argument(
-        "--use-spaces",
-        action="store_true",
-        help="Use spaces instead of tabs for indentation",
-    )
-    parser.add_argument(
+
+    # dest names match LinterConfig fields; None means "keep preset value"
+    def flag(name, dest, help):
+        add(name, dest=dest, action="store_true", default=None, help=help)
+
+    def num(name, dest, help):
+        add(name, dest=dest, type=int, help=help)
+
+    flag("--use-spaces", "use_spaces", "Use spaces instead of tabs for indentation")
+    num(
         "--primary-indent",
-        type=int,
-        help="Number of spaces for primary indentation (default: 4)",
+        "primary_indent_spaces",
+        "Number of spaces for primary indentation (default: 4)",
     )
-    parser.add_argument(
+    num(
         "--help-indent",
-        type=int,
-        help="Number of extra spaces for help text indentation (default: 2)",
+        "help_indent_spaces",
+        "Number of extra spaces for help text indentation (default: 2)",
     )
-    parser.add_argument(
+    num(
         "--max-line-length",
-        type=int,
-        help="Maximum line length (default: 100 for Zephyr, 120 for ESP-IDF)",
+        "max_line_length",
+        "Maximum line length (default: 100 for Zephyr, 120 for ESP-IDF)",
     )
-    parser.add_argument(
+    num(
         "--max-option-length",
-        type=int,
-        help="Maximum config option name length (default: 50)",
+        "max_option_name_length",
+        "Maximum config option name length (default: 50)",
     )
-    parser.add_argument(
+    flag(
         "--uppercase-configs",
-        action="store_true",
-        help="Require config names to be uppercase",
+        "enforce_uppercase_configs",
+        "Require config names to be uppercase",
     )
-    parser.add_argument(
+    num(
         "--min-prefix-length",
-        type=int,
-        help="Minimum prefix length for config names (default: 3 for ESP-IDF)",
+        "min_prefix_length",
+        "Minimum prefix length for config names (default: 3)",
     )
-    parser.add_argument(
+    flag(
         "--indent-sub-items",
-        action="store_true",
-        help="Use hierarchical indentation for sub-items (ESP-IDF style)",
+        "indent_sub_items",
+        "Use hierarchical indentation for sub-items (ESP-IDF style)",
     )
-    parser.add_argument(
+    flag(
         "--consolidate-empty-lines",
-        action="store_true",
-        help="Consolidate multiple consecutive empty lines into one",
+        "consolidate_empty_lines",
+        "Consolidate multiple consecutive empty lines into one",
     )
-    parser.add_argument(
+    flag(
         "--reflow-help",
-        action="store_true",
-        help="Reflow help text to fit within max line length",
+        "reflow_help_text",
+        "Reflow help text to fit within max line length",
     )
-    parser.add_argument("--verbose", action="store_true", help="Show detailed output")
-    parser.add_argument(
+    add("--verbose", action="store_true", help="Show detailed output")
+    add(
         "--dump-ast",
         action="store_true",
         help="Dump the parsed AST structure instead of linting/formatting",
     )
-    parser.add_argument(
+    add(
         "--print-formatted",
         action="store_true",
         help="Print formatted output to stdout instead of linting (for debugging)",
     )
+    return parser
 
-    args = parser.parse_args()
 
-    # Start with preset or default
-    if args.preset == "espidf":
-        config = LinterConfig.espidf_preset()
-    elif args.preset == "zephyr":
-        config = LinterConfig.zephyr_preset()
-    else:
-        config = LinterConfig.zephyr_preset()
+def _print_issues(header: str, issues: list[LintIssue]):
+    print(f"\n{header}")
+    for issue in sorted(issues, key=lambda x: x.line_number):
+        print(f"  {issue}")
 
-    # Override with command-line arguments
-    if args.use_spaces:
-        config.use_spaces = True
-    if args.primary_indent is not None:
-        config.primary_indent_spaces = args.primary_indent
-    if args.help_indent is not None:
-        config.help_indent_spaces = args.help_indent
-    if args.max_line_length is not None:
-        config.max_line_length = args.max_line_length
-    if args.max_option_length is not None:
-        config.max_option_name_length = args.max_option_length
-    if args.uppercase_configs:
-        config.enforce_uppercase_configs = True
-    if args.min_prefix_length is not None:
-        config.min_prefix_length = args.min_prefix_length
-    if args.indent_sub_items:
-        config.indent_sub_items = True
-    if args.consolidate_empty_lines:
-        config.consolidate_empty_lines = True
-    if args.reflow_help:
-        config.reflow_help_text = True
+
+def main():
+    """Main entry point for the linter."""
+    args = _build_arg_parser().parse_args()
+
+    config = getattr(LinterConfig, f"{args.preset}_preset")()
+    for f in fields(LinterConfig):
+        value = getattr(args, f.name, None)
+        if value is not None:
+            setattr(config, f.name, value)
 
     linter = KconfigLinter(config)
     total_issues = 0
     files_with_issues = 0
     files_formatted = 0
+    banner = "=" * 60
 
-    # Process each file
     for filepath in args.files:
         if not filepath.exists():
             print(f"Error: File not found: {filepath}", file=sys.stderr)
             continue
 
         if args.dump_ast:
-            # AST dump mode
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                ast = linter.parser.parse(content)
-                print(f"\n{'=' * 60}")
-                print(f"AST for {filepath}")
-                print(f"{'=' * 60}")
-                _dump_ast(ast, indent=0)
+                ast = linter.parser.parse(filepath.read_text(encoding="utf-8"))
             except Exception as e:
                 print(f"Error parsing {filepath}: {e}", file=sys.stderr)
-            exit(0)
+                continue
+            print(f"\n{banner}\nAST for {filepath}\n{banner}")
+            _dump_ast(ast)
+            continue
 
         if args.print_formatted:
-            # Print formatted output mode (for debugging)
-            try:
-                formatted_lines, issues = linter.format_file(filepath)
-
-                print(f"\n{'=' * 60}")
-                print(f"Formatted output for {filepath}")
-                print(f"{'=' * 60}")
-                for line in formatted_lines:
-                    print(line, end="")
-
-                if issues:
-                    print(f"\n\n{'=' * 60}")
-                    print("Unfixable issues:")
-                    print(f"{'=' * 60}")
-                    for issue in sorted(issues, key=lambda x: x.line_number):
-                        print(f"  {issue}")
-            except Exception as e:
-                print(f"Error formatting {filepath}: {e}", file=sys.stderr)
-                import traceback
-
-                traceback.print_exc()
+            formatted_lines, issues = linter.format_file(filepath)
+            print(f"\n{banner}\nFormatted output for {filepath}\n{banner}")
+            print("".join(formatted_lines), end="")
+            if issues:
+                _print_issues(f"\n{banner}\nUnfixable issues:\n{banner}", issues)
             continue
 
         if args.write:
-            # Format mode
             if args.verbose:
                 print(f"\nFormatting {filepath}...")
 
             formatted_lines, issues = linter.format_file(filepath)
+            if issues:
+                # Formatting failed; never overwrite the file in that case
+                _print_issues(f"{filepath} (not formatted):", issues)
+                total_issues += len(issues)
+                continue
 
-            # Write back to file
+            formatted = "".join(formatted_lines)
             try:
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.writelines(formatted_lines)
+                if formatted != filepath.read_text(encoding="utf-8"):
+                    filepath.write_text(formatted, encoding="utf-8")
                 files_formatted += 1
                 if args.verbose:
                     print("  ✓ Formatted")
-
-                if issues:
-                    print(f"\n{filepath} (unfixable issues):")
-                    for issue in sorted(issues, key=lambda x: x.line_number):
-                        print(f"  {issue}")
-                    total_issues += len(issues)
             except Exception as e:
                 print(f"Error writing {filepath}: {e}", file=sys.stderr)
+
+            # Issues the formatter can't fix (e.g. naming) still get reported
+            unfixable = linter.lint_file(filepath)
+            if unfixable:
+                _print_issues(f"{filepath} (unfixable issues):", unfixable)
+                total_issues += len(unfixable)
         else:
-            # Lint mode
             if args.verbose:
                 print(f"\nLinting {filepath}...")
 
             issues = linter.lint_file(filepath)
-
             if issues:
                 files_with_issues += 1
                 total_issues += len(issues)
-                print(f"\n{filepath}:")
-                for issue in sorted(issues, key=lambda x: x.line_number):
-                    print(f"  {issue}")
+                _print_issues(f"{filepath}:", issues)
 
-    # Summary
-    print(f"\n{'=' * 60}")
+    print(f"\n{banner}")
     if args.write:
         print(f"Formatted {files_formatted} file(s)")
         if total_issues > 0:
